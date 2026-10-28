@@ -1,0 +1,139 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v1.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: '26.1.10909125'
+  CMAKE_VERSION: '3.22.1'
+  BUILD_TOOLS: '34.0.0'
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # The action's default package list is "tools platform-tools", but the
+          # legacy "tools" package was removed in cmdline-tools 16+, which makes
+          # sdkmanager exit 1 on current runners. platform-tools is all we need.
+          packages: 'platform-tools'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install NDK, CMake and platform
+        run: |
+          set -euo pipefail
+          SDKMANAGER=$(command -v sdkmanager || true)
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort | tail -1)
+          fi
+          echo "sdkmanager: $SDKMANAGER"
+          "$SDKMANAGER" --install \
+            "platforms;android-34" \
+            "build-tools;${BUILD_TOOLS}" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+
+      # The APK is signed with the debug key. Caching the keystore keeps the
+      # signature stable across runs, otherwise every build would produce a
+      # different key and users could not upgrade in place.
+      - name: Cache debug keystore
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+
+      # `clean` is required: incremental packaging can leave a multi-hundred-KB
+      # placeholder hole inside the APK (zipflinger), which inflates the file.
+      - name: Build APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace clean assembleDebug
+
+      - name: Read version from APK
+        id: info
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 -type f | sort | tail -1)
+          BADGING=$("$AAPT2" dump badging "$APK" | head -1)
+          VERSION=$(echo "$BADGING" | sed -E "s/.*versionName='([^']+)'.*/\1/")
+          CODE=$(echo "$BADGING" | sed -E "s/.*versionCode='([^']+)'.*/\1/")
+          OUT="czn-speed-${VERSION}.apk"
+          cp "$APK" "$OUT"
+          {
+            echo "version=$VERSION"
+            echo "code=$CODE"
+            echo "apk=$OUT"
+            echo "size=$(stat -c%s "$OUT")"
+          } >> "$GITHUB_OUTPUT"
+          echo "built $OUT (versionCode $CODE)"
+
+      - name: Verify tag matches version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$TAG" != "${{ steps.info.outputs.version }}" ]; then
+            echo "::error::tag '$TAG' does not match versionName '${{ steps.info.outputs.version }}'"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: czn-speed-${{ steps.info.outputs.version }}
+          path: ${{ steps.info.outputs.apk }}
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: CZN Speed ${{ steps.info.outputs.version }}
+          files: ${{ steps.info.outputs.apk }}
+          generate_release_notes: true
+          append_body: true
+          body: |
+            ### 安装
+
+            1. 安装 `${{ steps.info.outputs.apk }}`。
+            2. 在 LSPosed 管理器中启用 **CZN Speed**，并在作用域里勾选目标游戏（推荐作用域已预置，可直接勾选）。
+            3. 强制停止游戏进程后重新启动。
+
+            ### 构建信息
+
+            | 项目 | 值 |
+            | --- | --- |
+            | versionName | `${{ steps.info.outputs.version }}` |
+            | versionCode | `${{ steps.info.outputs.code }}` |
+            | APK 大小 | ${{ steps.info.outputs.size }} 字节 |
+            | 架构 | arm64-v8a |
+            | 签名 | debug key |
+
+            > 本模块为第三方软件，存在账号被处罚的风险。详见 README。

@@ -1,0 +1,31 @@
+# ---- build outputs ----
+.gradle/
+build/
+app/build/
+.cxx/
+captures/
+local.properties
+
+# ---- generated JS artifacts (produced by CMake before compiling) ----
+app/src/main/cpp/mod_js.js
+app/src/main/cpp/mod_js.h
+
+# ---- signing material ----
+*.jks
+*.keystore
+keystore.properties
+
+# ---- IDE / OS ----
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Android Studio pins a JetBrains JDK here; CI uses its own temurin toolchain
+gradle/gradle-daemon-jvm.properties
+
+# ---- local AI workspace ----
+.workbuddy-ai/
+
+# ---- misc ----
+*.log

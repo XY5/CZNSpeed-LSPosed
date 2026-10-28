@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- LSPosed reads this array as the module's recommended scope: the manager
+         pre-checks these packages when the module is enabled. -->
+    <string-array name="xposed_scope">
+        <item>com.smilegate.chaoszero.stove.google</item>
+    </string-array>
+</resources>

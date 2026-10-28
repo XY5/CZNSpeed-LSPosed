@@ -1,0 +1,15 @@
+# Normalize to LF on checkout: extract_js.py asserts that no CR leaks into the
+# assembled JS bundle, so a CRLF checkout would break the build on any platform.
+* text=auto eol=lf
+
+# Windows launchers keep CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binary assets must never be line-ending converted
+*.jks      binary
+*.keystore binary
+*.jar      binary
+*.so       binary
+*.png      binary
+*.apk      binary
