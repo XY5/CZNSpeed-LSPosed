@@ -158,12 +158,24 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
 // game pinned at 1x. A guard is now a deadline on the wall clock, and the boot
 // tick reconciles the live timeScale against _curSpeed, so the release cannot
 // be lost -- worst case it lands one tick late.
+//
+// Reconciliation must cover every channel _setEngineSpeed writes, not just
+// director slot 0. A skill cut-in that drops the battle scheduler living in
+// another getSchedulerByIndex() slot (or the yuna time_scale env) leaves slot 0
+// reading back the user's speed: the ball keeps showing 5x while the battle
+// runs at 1x, and a slot-0-only check never sees the drift. Re-picking a level
+// fixed it because that path rewrites all slots plus the env.
 (function () {
     var ST = { until: 0, since: 0, reason: '', cb: null };
     var HARD_MAX = 60000;      // no guard outlives this, whatever its reason
     var LEGACY_GRACE = 10000;  // flag raised by an unmigrated path, no deadline
-    var RECO_MS = 800;         // min gap between reconciliations
+    var RECO_MS = 300;         // min gap between reconciliations
+    var TS_LOG_MAX = 24;       // external timeScale writes worth recording
     var _lastReco = 0;
+    var _selfWrite = false;
+    var _tsLogs = 0;
+    var _lastBad = '';
+    var _envOk = -1;           // -1 unknown, 0 engine ignores the env, 1 readable
 
     function _spd() {
         var v = globalThis._curSpeed;
@@ -181,23 +193,82 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
 
     globalThis._guardState = ST;
 
-    globalThis._setEngineSpeed = function (v) {
+    // every channel the game can drop to 1x: the director's scheduler slots
+    // (the battle scheduler is often not slot 0) plus the engine env
+    function _schedList() {
+        var out = [];
         try {
             var dir = cc.Director.getInstance();
-            var sc = dir.getScheduler();
-            if (sc && typeof sc.setTimeScale === 'function') sc.setTimeScale(v);
-            if (typeof dir.getSchedulerByIndex === 'function') {
+            var main = (dir && dir.getScheduler) ? dir.getScheduler() : null;
+            if (main) out.push(main);
+            if (dir && typeof dir.getSchedulerByIndex === 'function') {
                 for (var i = 0; i < 5; i++) {
                     try {
                         var s = dir.getSchedulerByIndex(i);
-                        if (s && typeof s.setTimeScale === 'function') s.setTimeScale(v);
+                        if (s && out.indexOf(s) < 0) out.push(s);
                     } catch (e) { }
                 }
             }
-            if (typeof yuna !== 'undefined' && yuna && yuna.setenv) yuna.setenv('time_scale', v);
-            return true;
-        } catch (e) { return false; }
+        } catch (e) { }
+        return out;
+    }
+
+    globalThis._setEngineSpeed = function (v) {
+        _selfWrite = true;
+        var ok = false;
+        try {
+            var list = _schedList();
+            for (var i = 0; i < list.length; i++) {
+                try {
+                    if (typeof list[i].setTimeScale === 'function') { list[i].setTimeScale(v); ok = true; }
+                } catch (e) { }
+            }
+            if (typeof yuna !== 'undefined' && yuna && yuna.setenv) {
+                yuna.setenv('time_scale', v);
+                ok = true;
+                if (_envOk < 0) {          // does this engine read the env back?
+                    try {
+                        var ev = (typeof yuna.getenv === 'function') ? parseFloat(yuna.getenv('time_scale')) : NaN;
+                        _envOk = (!isNaN(ev) && Math.abs(ev - v) < 0.005) ? 1 : 0;
+                        globalThis._slog('[GUARD] env channel ' + (_envOk ? 'ok' : 'n/a'));
+                    } catch (e) { _envOk = 0; }
+                }
+            }
+        } catch (e) { }
+        _selfWrite = false;
+        return ok;
     };
+
+    // observer only -- never rewrites the value. Records game-side writes so
+    // .czn_status shows which code path dropped the engine off-speed.
+    function _hookSched(list) {
+        for (var i = 0; i < list.length; i++) {
+            var sc = list[i];
+            try {
+                if (!sc || sc.__cznTSHooked || typeof sc.setTimeScale !== 'function') continue;
+                sc.__cznTSHooked = true;
+                var orig = sc.setTimeScale;
+                if (orig.__cznWrap) continue;
+                var w = function (v) {
+                    try {
+                        if (!_selfWrite) {
+                            var want = globalThis._curSpeed;
+                            if (typeof v === 'number' && typeof want === 'number' && Math.abs(v - want) > 0.005) {
+                                var stk = '';
+                                try { stk = String(new Error().stack || '').split('\n').slice(1, 3).join(' | '); } catch (e) { }
+                                var line = '[TS] ext ' + v + ' want ' + want + ' @ ' + stk.substring(0, 160);
+                                globalThis._slog(line);
+                                if (_tsLogs < TS_LOG_MAX) { _tsLogs++; globalThis._crumb(line); }
+                            }
+                        }
+                    } catch (e) { }
+                    return orig.call(this, v);
+                };
+                w.__cznWrap = true;
+                sc.setTimeScale = w;
+            } catch (e) { }
+        }
+    }
 
     // unconditional: _curSpeed is the user's intent and is never rewritten
     // while a guard is up, so putting it back is always the right move
@@ -208,12 +279,30 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
         globalThis._slog('[GUARD] restore ' + v + 'x');
     };
 
+    // the game can re-apply its own speed a frame or two after ours lands
+    // (skill cast, cut-in teardown, scene swap), so re-assert a few times
+    function _replay() {
+        globalThis._restoreSpeed();
+        var st = globalThis._origSetTimeout;
+        if (typeof st !== 'function') return;
+        var steps = [120, 400, 1200];
+        for (var i = 0; i < steps.length; i++) {
+            (function (d) {
+                try {
+                    st(function () {
+                        try { if (!globalThis._sparkGuardActive) globalThis._restoreSpeed(); } catch (e) { }
+                    }, d);
+                } catch (e) { }
+            })(steps[i]);
+        }
+    }
+
     function _release(why) {
         var cb = ST.cb;
         ST.until = 0; ST.since = 0; ST.reason = ''; ST.cb = null;
         globalThis._sparkGuardActive = false;
         if (cb) { try { cb(); } catch (e) { } }
-        globalThis._restoreSpeed();
+        _replay();
         globalThis._slog('[GUARD] <<< release (' + why + ')');
         if (why.indexOf('hard') >= 0 || why.indexOf('legacy') >= 0) {
             try { globalThis._crumb('guard-stuck: ' + why); } catch (e) { }
@@ -248,6 +337,8 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
 
     globalThis._guardTick = function () {
         var now = Date.now();
+        var list = _schedList();
+        if (list.length > 0) { try { _hookSched(list); } catch (e) { } }
         if (globalThis._sparkGuardActive) {
             if (ST.until > 0) {
                 if (now >= ST.until) _release('deadline ' + ST.reason);
@@ -261,17 +352,33 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
         ST.since = 0;
         // reconcile: nothing may leave the engine running off-speed
         if (now - _lastReco < RECO_MS) return;
-        try {
-            var sc = cc.Director.getInstance().getScheduler();
-            if (!sc || typeof sc.getTimeScale !== 'function') return;
-            var cur = sc.getTimeScale(), want = globalThis._curSpeed;
-            if (typeof cur !== 'number' || typeof want !== 'number') return;
-            if (Math.abs(cur - want) > 0.005) {
-                _lastReco = now;
-                globalThis._slog('[GUARD] reconcile ' + cur + ' -> ' + want);
-                globalThis._restoreSpeed();
-            }
-        } catch (e) { }
+        var want = globalThis._curSpeed;
+        if (typeof want !== 'number' || !isFinite(want)) return;
+        var bad = null;
+        for (var i = 0; i < list.length && !bad; i++) {
+            try {
+                var sc = list[i];
+                if (typeof sc.getTimeScale !== 'function') continue;
+                var cur = sc.getTimeScale();
+                if (typeof cur === 'number' && isFinite(cur) && Math.abs(cur - want) > 0.005) bad = { k: 'slot' + i, v: cur };
+            } catch (e) { }
+        }
+        if (!bad && _envOk === 1) {
+            try {
+                if (typeof yuna !== 'undefined' && yuna && typeof yuna.getenv === 'function') {
+                    var ev = parseFloat(yuna.getenv('time_scale'));
+                    if (!isNaN(ev) && Math.abs(ev - want) > 0.005) bad = { k: 'env', v: ev };
+                }
+            } catch (e) { }
+        }
+        if (!bad) { _lastBad = ''; return; }
+        _lastReco = now;
+        var sig = bad.k + '=' + bad.v;
+        if (sig !== _lastBad) {          // a game loop fighting us must not flood the ring
+            _lastBad = sig;
+            globalThis._slog('[GUARD] reconcile ' + bad.k + ' ' + bad.v + ' -> ' + want);
+        }
+        globalThis._restoreSpeed();
     };
 })();
 // --- [MODULE END] 05_guard ---
