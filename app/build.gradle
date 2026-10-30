@@ -14,7 +14,7 @@ android {
 
         // semver: versionCode is derived from MAJOR.MINOR.PATCH so the two
         // can never drift apart (MINOR/PATCH are capped at 99).
-        def vMajor = 1, vMinor = 0, vPatch = 0
+        def vMajor = 1, vMinor = 0, vPatch = 1
         versionCode vMajor * 10000 + vMinor * 100 + vPatch
         versionName "${vMajor}.${vMinor}.${vPatch}"
 
