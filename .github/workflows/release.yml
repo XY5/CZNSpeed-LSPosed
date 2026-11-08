@@ -70,10 +70,23 @@ jobs:
 
       # `clean` is required: incremental packaging can leave a multi-hundred-KB
       # placeholder hole inside the APK (zipflinger), which inflates the file.
+      #
+      # Retry: the wrapper resolves services.gradle.org, which now redirects to
+      # github.com/gradle/gradle-distributions -- a CDN hiccup there (HTTP 504)
+      # kills the whole release before a single line is compiled. Three tries.
       - name: Build APK
         run: |
+          set -uo pipefail
           chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace clean assembleDebug
+          for attempt in 1 2 3; do
+            if ./gradlew --no-daemon --stacktrace clean assembleDebug; then
+              exit 0
+            fi
+            echo "::warning::gradle attempt ${attempt} failed, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::gradle build failed after 3 attempts"
+          exit 1
 
       - name: Read version from APK
         id: info
