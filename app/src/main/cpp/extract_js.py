@@ -86,7 +86,7 @@ SEC04 = r"""// --- [MODULE START] 04_config ---
     if (globalThis._skipOnBoot === undefined) globalThis._skipOnBoot = false;
     if (globalThis._btnPosX === undefined) globalThis._btnPosX = 60;
     if (globalThis._btnPosY === undefined) globalThis._btnPosY = 100;
-    if (globalThis._speedsList === undefined) globalThis._speedsList = [0, 0.5, 1, 2, 3, 5, 10, 20];   // editable speed levels
+    if (globalThis._speedsList === undefined) globalThis._speedsList = [0, 0.5, 1, 3, 5, 10];   // editable speed levels
 
     var FU = function () { try { return cc.FileUtils.getInstance(); } catch (e) { return null; } };
     var _path = function () { var f = FU(); return ((f && f.getWritablePath) ? f.getWritablePath() : '') + 'cfg.dat'; };
@@ -141,25 +141,40 @@ SEC04 = r"""// --- [MODULE START] 04_config ---
             f.writeStringToFile(txt, _path());
         } catch (e) { }
     };
-    globalThis._crumb = function (s) {   // one-line diagnostic breadcrumb
-        try { var f = FU(); if (f) f.writeStringToFile(s, f.getWritablePath() + '.czn_status'); } catch (e) { }
-    };
-    // Capped append log for the layer's lifecycle (boot / attach / neutralise /
-    // re-inject). _crumb only keeps the last line, which loses the sequence
-    // that matters when a crash is reported; this keeps the tail. Key events
-    // only -- each call rewrites <=150 short lines.
+    // ---- diagnostics -----------------------------------------------------
+    // Two files, two owners -- they used to share .czn_status and clobber each
+    // other, which is why a crash report could show only a JS breadcrumb and
+    // none of the injection state:
+    //   .czn_status  native only: one line of injection state
+    //   .czn_log     this layer: lifecycle lines (boot / attach / re-arm / error)
+    // .czn_log is bounded by construction: newest 120 lines, each clipped to
+    // 300 chars (so <= ~36KB, typically ~5KB), and a repeated line is dropped
+    // instead of appended. No rotation needed -- a session only emits a handful
+    // of lines, so the tail covers several sessions. 300 rather than 200 because
+    // the longest line is the timeScale crumb ("[TS] ext ... @ <stack>"), whose
+    // caller already trims the stack to 160 chars; the useful caller frame sits
+    // at the END of it. Full exception text goes to .czn_dump, never here.
+    var LOG_LINES = 120;
+    var LOG_CLIP = 300;
     globalThis._alog = function (msg) {
         try {
             var f = FU(); if (!f) return;
             var p = f.getWritablePath() + '.czn_log';
+            var line = Date.now() + ' ' + msg;
+            if (line.length > LOG_CLIP) line = line.substring(0, LOG_CLIP) + '...';
             var old = '';
             try { if (f.isFileExist(p)) old = f.getStringFromFile(p) || ''; } catch (e) { }
-            var lines = old.split('\n');
-            if (lines.length > 150) lines = lines.slice(lines.length - 150);
-            lines.push(Date.now() + ' ' + msg);
+            var lines = old.length ? old.split('\n') : [];
+            while (lines.length && lines[lines.length - 1] === '') lines.pop();
+            if (lines.length && lines[lines.length - 1] === line) return;   // dedupe
+            lines.push(line);
+            if (lines.length > LOG_LINES) lines = lines.slice(lines.length - LOG_LINES);
             f.writeStringToFile(lines.join('\n') + '\n', p);
         } catch (e) { }
     };
+    // breadcrumb: same stream, tagged, so it survives next to the lifecycle
+    // lines instead of overwriting the native state file
+    globalThis._crumb = function (s) { globalThis._alog('crumb: ' + s); };
     // parse a speed-level list from ",", "，", or whitespace separators:
     // dedup, ascending, keep 1, clamp to [0, 999], force 2..8 entries.
     globalThis._parseLevels = function (str) {
@@ -276,7 +291,7 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
     };
 
     // observer only -- never rewrites the value. Records game-side writes so
-    // .czn_status shows which code path dropped the engine off-speed.
+    // .czn_log shows which code path dropped the engine off-speed.
     function _hookSched(list) {
         for (var i = 0; i < list.length; i++) {
             var sc = list[i];
@@ -290,9 +305,17 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
                         if (!_selfWrite) {
                             var want = globalThis._curSpeed;
                             if (typeof v === 'number' && typeof want === 'number' && Math.abs(v - want) > 0.005) {
+                                // stack[0]="Error", stack[1]=this wrapper (noise), so
+                                // start at 2: those are the game's own frames. Trim the
+                                // "    at " indent and keep 3 -- 200 chars is then all
+                                // signal, and it still fits the 300-char log line.
                                 var stk = '';
-                                try { stk = String(new Error().stack || '').split('\n').slice(1, 3).join(' | '); } catch (e) { }
-                                var line = '[TS] ext ' + v + ' want ' + want + ' @ ' + stk.substring(0, 160);
+                                try {
+                                    var fr = String(new Error().stack || '').split('\n').slice(2, 5);
+                                    for (var fi = 0; fi < fr.length; fi++) fr[fi] = String(fr[fi]).replace(/^\s+/, '');
+                                    stk = fr.join(' | ');
+                                } catch (e) { }
+                                var line = '[TS] ext ' + v + ' want ' + want + ' @ ' + stk.substring(0, 200);
                                 globalThis._slog(line);
                                 if (_tsLogs < TS_LOG_MAX) { _tsLogs++; globalThis._crumb(line); }
                             }
@@ -462,7 +485,7 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
         if (isNaN(v) || !isFinite(v)) v = 1;
         return Math.max(0, Math.min(999, Math.round(v * 100) / 100));
     }
-    function _levels() { return globalThis._speedsList || [0, 0.5, 1, 2, 3, 5, 10, 20]; }
+    function _levels() { return globalThis._speedsList || [0, 0.5, 1, 3, 5, 10]; }
     function _findIdx(v) {
         var L = _levels();
         for (var i = 0; i < L.length; i++) if (Math.abs(L[i] - v) < 0.001) return i;
@@ -1242,8 +1265,10 @@ out = out.replace("(typeof globalThis._SPEED_LEVELS !== 'undefined' && typeof gl
 # ---------------------------------------------------------------- visibility
 # NOTE: no setTimeout diagnostics here. Every eval re-registers them on the
 # engine's timer list, and a timer whose JS callback belongs to a context the
-# engine has since destroyed is a dangling call (segfault on fire). Diagnostics
-# go through __modDump on error and the .czn_log breadcrumb instead.
+# engine has since destroyed is a dangling call (segfault on fire).
+# The dump gets its own file: .czn_status belongs to the native side (injection
+# state) and .czn_log to the layer's lifecycle, so an exception dump must not
+# overwrite either.
 PRELUDE = (
     "(function () {\n"
     "    function _dump() {\n"
@@ -1252,7 +1277,7 @@ PRELUDE = (
     "            var body = '';\n"
     "            if (globalThis.__modErr) body += 'MOD_ERR:' + globalThis.__modErr + '\\n';\n"
     "            body += 'RING:' + (globalThis._slogDump ? globalThis._slogDump() : '');\n"
-    "            fu.writeStringToFile(body, fu.getWritablePath() + '.czn_status');\n"
+    "            fu.writeStringToFile(body, fu.getWritablePath() + '.czn_dump');\n"
     "        } catch (e2) { }\n"
     "    }\n"
     "    globalThis.__modDump = _dump;\n"
