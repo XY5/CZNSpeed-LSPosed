@@ -316,6 +316,10 @@
         },
 
         ensureGuardsInstalled: function() {
+            // flags bit 0x800: prototype hooks (Map.set / Function.bind /
+            // Node.update trap) are invasive global monkey-patches; they can be
+            // switched off from czn_flags for crash bisection.
+            if (globalThis._fl && !globalThis._fl(0x800)) return;
             if (!this._sparkGuardInstalled) { try { this.install(); } catch (e) { } }
             if (!globalThis._comprehensiveSparkGuardInstalled || !globalThis._comprehensiveSparkGuardPhase4Done) {
                 try { this.installComprehensive(); } catch (e) { }

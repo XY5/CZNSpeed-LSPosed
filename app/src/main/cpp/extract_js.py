@@ -49,8 +49,6 @@ SEC00 = r"""// --- [MODULE START] 00_timers ---
             return origSetInterval.call(this, handler, t);
         };
         globalThis._timersHooked = true;
-        globalThis._origSetTimeout = origSetTimeout;
-        globalThis._origSetInterval = origSetInterval;
     } catch (e) { }
 })();
 // --- [MODULE END] 00_timers ---
@@ -80,14 +78,36 @@ SEC04 = r"""// --- [MODULE START] 04_config ---
     };
     globalThis._slogDump = function () { return _ring.join('\n'); };
 
-    globalThis._curSpeed = 1;          // applied speed (float, single source of truth)
-    globalThis._skipOnBoot = false;
-    globalThis._btnPosX = 60;
-    globalThis._btnPosY = 100;
-    globalThis._speedsList = [0, 0.5, 1, 2, 3, 5, 10, 20];   // editable speed levels
+    // Idempotent defaults: a re-inject (V8 context rebuild on a scene swap)
+    // re-runs this whole bundle into a fresh globalThis. If the config already
+    // survived a same-context re-eval we must NOT clobber it; only seed when
+    // the value is absent.
+    if (globalThis._curSpeed === undefined) globalThis._curSpeed = 1;          // applied speed (float, single source of truth)
+    if (globalThis._skipOnBoot === undefined) globalThis._skipOnBoot = false;
+    if (globalThis._btnPosX === undefined) globalThis._btnPosX = 60;
+    if (globalThis._btnPosY === undefined) globalThis._btnPosY = 100;
+    if (globalThis._speedsList === undefined) globalThis._speedsList = [0, 0.5, 1, 2, 3, 5, 10, 20];   // editable speed levels
 
     var FU = function () { try { return cc.FileUtils.getInstance(); } catch (e) { return null; } };
     var _path = function () { var f = FU(); return ((f && f.getWritablePath) ? f.getWritablePath() : '') + 'cfg.dat'; };
+
+    // Runtime feature mask, read from <files>/czn_flags as hex (e.g. "1f3").
+    // Absent file = everything on. Native side reads the same file for its own
+    // bits. Kept in the shipped build: it is the fastest way to bisect a crash
+    // report on a user device without a rebuild.
+    //   0x100 overlay UI   0x200 tick driver   0x400 timeScale guard
+    //   0x800 prototype hooks (spark guard)    0x1000 touch listener
+    globalThis._flags = 0xFFFFFFFF;
+    try {
+        var _ff = FU();
+        if (_ff && _ff.isFileExist(_ff.getWritablePath() + 'czn_flags')) {
+            var _raw = String(_ff.getStringFromFile(_ff.getWritablePath() + 'czn_flags') || '');
+            _raw = _raw.replace(/[^0-9a-fA-FxX]/g, '');
+            var _fv = parseInt(_raw, 16);
+            if (!isNaN(_fv)) globalThis._flags = _fv;
+        }
+    } catch (e) { }
+    globalThis._fl = function (bit) { return (globalThis._flags & bit) !== 0; };
 
     globalThis._loadSpeedConfig = function () {
         try {
@@ -123,6 +143,22 @@ SEC04 = r"""// --- [MODULE START] 04_config ---
     };
     globalThis._crumb = function (s) {   // one-line diagnostic breadcrumb
         try { var f = FU(); if (f) f.writeStringToFile(s, f.getWritablePath() + '.czn_status'); } catch (e) { }
+    };
+    // Capped append log for the layer's lifecycle (boot / attach / neutralise /
+    // re-inject). _crumb only keeps the last line, which loses the sequence
+    // that matters when a crash is reported; this keeps the tail. Key events
+    // only -- each call rewrites <=150 short lines.
+    globalThis._alog = function (msg) {
+        try {
+            var f = FU(); if (!f) return;
+            var p = f.getWritablePath() + '.czn_log';
+            var old = '';
+            try { if (f.isFileExist(p)) old = f.getStringFromFile(p) || ''; } catch (e) { }
+            var lines = old.split('\n');
+            if (lines.length > 150) lines = lines.slice(lines.length - 150);
+            lines.push(Date.now() + ' ' + msg);
+            f.writeStringToFile(lines.join('\n') + '\n', p);
+        } catch (e) { }
     };
     // parse a speed-level list from ",", "，", or whitespace separators:
     // dedup, ascending, keep 1, clamp to [0, 999], force 2..8 entries.
@@ -280,21 +316,14 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
     };
 
     // the game can re-apply its own speed a frame or two after ours lands
-    // (skill cast, cut-in teardown, scene swap), so re-assert a few times
+    // (skill cast, cut-in teardown, scene swap). No engine timers here on
+    // purpose: a setTimeout registered now outlives the V8 context if the
+    // engine rebuilds it mid scene-swap, and firing it afterwards calls into a
+    // destroyed context (segfault). Clearing the reconcile gate makes the boot
+    // tick re-check on its very next tick instead.
     function _replay() {
         globalThis._restoreSpeed();
-        var st = globalThis._origSetTimeout;
-        if (typeof st !== 'function') return;
-        var steps = [120, 400, 1200];
-        for (var i = 0; i < steps.length; i++) {
-            (function (d) {
-                try {
-                    st(function () {
-                        try { if (!globalThis._sparkGuardActive) globalThis._restoreSpeed(); } catch (e) { }
-                    }, d);
-                } catch (e) { }
-            })(steps[i]);
-        }
+        _lastReco = 0;
     }
 
     function _release(why) {
@@ -336,6 +365,7 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
     };
 
     globalThis._guardTick = function () {
+        if (!globalThis._fl(0x400)) return;     // guard disabled by flags
         var now = Date.now();
         var list = _schedList();
         if (list.length > 0) { try { _hookSched(list); } catch (e) { } }
@@ -371,7 +401,7 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
                 }
             } catch (e) { }
         }
-        if (!bad) { _lastBad = ''; return; }
+        if (!bad) { _lastBad = ''; _lastReco = now; return; }
         _lastReco = now;
         var sig = bad.k + '=' + bad.v;
         if (sig !== _lastBad) {          // a game loop fighting us must not flood the ring
@@ -552,7 +582,7 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
         if (!wg) return null;
         try { wg.setAnchorPoint(0, 0); } catch (e) { }
         try { wg.setContentSize(cc.size(w, h)); } catch (e) { try { wg.setContentSize({ width: w, height: h }); } catch (e2) { } }
-        try { wg.setTouchEnabled(true); } catch (e) { }
+        try { wg.setTouchEnabled(globalThis._fl(0x1000)); } catch (e) { }
         try {
             wg.addTouchEventListener(function (sender, state, x, y) {
                 try {
@@ -951,6 +981,7 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
     }
     function _attach(scene) {
         if (!scene) return { ok: false, why: 'no-scene' };
+        if (!globalThis._fl(0x100)) return { ok: false, why: 'ui-off' };
         if (ui && ui.btn && ui.btn.getParent() === scene) {
             if (_hidden) _enterHidden(); else _paintBall();
             _buildGhostPreview();
@@ -960,6 +991,14 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
             _clearOverlayNodes();
             _killGhost();
             _killGhostPreview();
+            // Our own node from an earlier scene in THIS context: its callbacks
+            // belong to the live context, so destroying it is safe. Nodes left
+            // over from a previous context are never touched here -- they are
+            // made inert by the neutralizer in BOOT (see the comment there).
+            if (ui && ui.btn) {
+                try { ui.btn.removeFromParent(); } catch (e) { }
+                ui = null; globalThis._cznUI = null;
+            }
             var useCcui = _ccuiAvailable();
             var node = null;
             if (useCcui) {
@@ -970,6 +1009,7 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
                 try { node.setAnchorPoint(0, 0); } catch (e) { }
             }
             if (!node) return { ok: false, why: 'no-node' };
+            try { node.setName('__czn_speed_ui'); } catch (e) { }
             try { node.setPosition(globalThis._btnPosX, globalThis._btnPosY); } catch (e) { }
             scene.addChild(node, 99990);
             ui = { btn: node, scene: scene, path: useCcui ? 'ccui' : 'node', useCcui: useCcui };
@@ -982,6 +1022,9 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
             if (_hidden) { _enterHidden(); } else { _paintBall(); _pinBallOpaque(); }
             _buildGhostPreview();
             _probeOnce();
+            globalThis._alog('attach ok path=' + ui.path +
+                ' kids=' + (scene.getChildren ? scene.getChildren().length : -1) +
+                ' hidden=' + _hidden);
             return { ok: true };
         } catch (e) { return { ok: false, why: 'build:' + e }; }
     }
@@ -1033,6 +1076,7 @@ BOOT = r"""
 (function () {
     globalThis.__cznTickN = 0;
     globalThis.__cznLastNote = '';
+    try { globalThis._alog('boot eval ctx=' + globalThis.__cznCtxId); } catch (e) { }
     globalThis.__cznBootTick = function () {
         var note = '';
         try {
@@ -1079,49 +1123,84 @@ BOOT = r"""
     };
     globalThis._cznUI = null;
 
-    // ---- periodic driver installer (retries until a channel works) --------
+    // ---- tick driver -----------------------------------------------------
+    // A scene-anchored RepeatForever action and nothing else. A callback
+    // registered on the Director's scheduler, or a setTimeout chain, outlives
+    // the scene AND the V8 context: after the engine rebuilds the context the
+    // engine still holds the old JS function and firing it segfaults. An action
+    // dies with its scene, so the engine releases the CallFunc while the
+    // context is still valid.
+    //
+    // The flip side is that the driver dies on EVERY scene swap, in the same
+    // context as well. So it must be re-armable: __cznArmDriver() is idempotent
+    // and is called by the native side (from the asset-read hook, i.e. exactly
+    // while the game loads the next scene) whenever the probe reports that the
+    // driver is no longer parented to the running scene.
     var rep = [], ok = false;
     try {
         var dir = cc.Director.getInstance();
         var tick = function () {
             try { if (typeof globalThis.__cznBootTick === 'function') globalThis.__cznBootTick(); } catch (e) { }
         };
-        // channel A: JSB scheduler timers (multi-signature; error text logged)
-        if (globalThis.__cznTimerOk) { rep.push('timer=ok'); ok = true; }
-        else {
+
+        // Neutralize leftovers from a PREVIOUS V8 context. Such a node still
+        // sits in the scene graph and its JS callbacks (the ccui touch listener,
+        // the action's CallFunc) point into a context the engine has already
+        // destroyed. Destroying it -- removeFromParent() -- releases those
+        // handles and segfaults (cocos2d actually releases at pool drain, i.e.
+        // at the end of the same frame), so make it inert instead.
+        var neutralize = function (scene) {
             try {
-                var sched = dir.getScheduler ? dir.getScheduler() : null;
-                if (sched && typeof sched.schedule === 'function') {
-                    var REP = (cc.REPEAT_FOREVER !== undefined) ? cc.REPEAT_FOREVER : 0xFFFFFFFF;
-                    var variants = [
-                        function (cb, t) { sched.schedule(cb, t, 0.5, REP, 0, false); },
-                        function (cb, t) { sched.schedule(cb, t, 0.5); },
-                        function (cb, t) { sched.schedule(cb, 0.5); }
-                    ];
-                    for (var i = 0; i < variants.length && !ok; i++) {
-                        try { var tgt = { _modTick: true }; variants[i](tick, tgt);
-                              globalThis.__cznTimerOk = true; ok = true; rep.push('sched' + i + '=ok'); }
-                        catch (e) { rep.push('sched' + i + '=' + e); }
+                var kids = scene.getChildren ? scene.getChildren() : null;
+                var am = null;
+                try { am = dir.getActionManager ? dir.getActionManager() : null; } catch (e) { }
+                for (var ki = 0; kids && ki < kids.length; ki++) {
+                    var kk = kids[ki];
+                    if (!kk || typeof kk.getName !== 'function') continue;
+                    var nm = '';
+                    try { nm = String(kk.getName()); } catch (e) { continue; }
+                    if (nm !== '__czn_speed_ui' && nm !== '__czn_tick') continue;
+                    globalThis._alog('neutralize ' + nm + ' idx=' + ki);
+                    try { kk.setVisible(false); } catch (e) { }
+                    if (nm === '__czn_tick' && am && typeof am.pauseTarget === 'function') {
+                        try { am.pauseTarget(kk); } catch (e) { }
                     }
-                } else rep.push('no-schedule-fn');
-            } catch (e) { rep.push('sched=' + e); }
-        }
-        // channel B: scene-anchored action (needs a running scene)
-        if (globalThis.__cznActionOk) { rep.push('action=ok'); ok = true; }
-        else {
+                }
+            } catch (e) { globalThis._alog('neutralize err ' + e); }
+        };
+
+        globalThis.__cznArmDriver = function () {
             try {
+                if (!globalThis._fl(0x200)) return '1';
                 var scene = dir.getRunningScene ? dir.getRunningScene() : null;
-                if (scene) {
-                    var node = (cc.Node && cc.Node.create) ? cc.Node.create() : new cc.Node();
-                    scene.addChild(node);
-                    var d = cc.DelayTime.create(0.5);
-                    var c2 = cc.CallFunc.create(tick);
-                    var sq = cc.Sequence.create(d, c2);
-                    node.runAction((cc.RepeatForever && cc.RepeatForever.create) ? cc.RepeatForever.create(sq) : sq);
-                    globalThis.__cznActionOk = true; ok = true; rep.push('action=ok');
-                } else rep.push('action=scene-null');
-            } catch (e) { rep.push('action=' + e); }
-        }
+                if (!scene) return '0';
+                var cur = globalThis.__cznTickNode;
+                if (cur && cur.getParent && cur.getParent() === scene) return '1';
+                // Our own driver from an earlier scene in THIS context: its
+                // CallFunc belongs to the live context, so releasing it is safe.
+                if (cur) {
+                    try { cur.stopAllActions(); } catch (e) { }
+                    try { cur.removeFromParent(); } catch (e) { }
+                    globalThis.__cznTickNode = null;
+                }
+                neutralize(scene);
+                var node = (cc.Node && cc.Node.create) ? cc.Node.create() : new cc.Node();
+                try { node.setName('__czn_tick'); } catch (e) { }
+                scene.addChild(node);
+                globalThis.__cznTickNode = node;
+                var sq = cc.Sequence.create(cc.DelayTime.create(0.5), cc.CallFunc.create(tick));
+                node.runAction((cc.RepeatForever && cc.RepeatForever.create) ? cc.RepeatForever.create(sq) : sq);
+                globalThis._alog('driver armed ctx=' + globalThis.__cznCtxId +
+                    ' scene=' + (scene.getName ? String(scene.getName()) : '?'));
+                // attach the UI now instead of waiting one tick
+                try { globalThis.__cznBootTick(); } catch (e) { }
+                return '1';
+            } catch (e) { globalThis._alog('arm err ' + e); return '0'; }
+        };
+
+        var ar = globalThis.__cznArmDriver();
+        rep.push('arm=' + ar);
+        ok = (ar === '1');
         globalThis._crumb('install: ' + rep.join(' '));
     } catch (e) {
         try { globalThis._crumb('install fatal: ' + e); } catch (e2) { }
@@ -1132,8 +1211,19 @@ BOOT = r"""
 
 order = ["00_timers.js", "03_framework.js", "04_logger_config.js", "05_guard.js",
          "06_spark_guard.js", "07_anim_skip.js", "09_speed_ui.js"]
+# Context marker -- the native side probes this global to decide whether this
+# V8 context already carries the layer. It must be the FIRST statement so it is
+# in place even if a later section throws. Do not compare V8 context pointers
+# natively instead: Local<Context> is a HandleScope slot address, not an object
+# address, so the same context reports different values on every call.
+MARKER = (
+    "globalThis.__cznCtxId = (typeof globalThis.__cznCtxId === 'number')\n"
+    "    ? globalThis.__cznCtxId\n"
+    "    : ((Date.now() % 1000000) * 1000 + Math.floor(Math.random() * 1000));\n"
+)
 parts = ["// CZN runtime module JS",
-         "// sections: " + ", ".join(order), ""]
+         "// sections: " + ", ".join(order), "",
+         MARKER]
 for name in order:
     parts.append("// ======== " + name + " ========")
     if name in ("06_spark_guard.js", "07_anim_skip.js"):
@@ -1150,6 +1240,10 @@ out = out.replace("(typeof globalThis._SPEED_LEVELS !== 'undefined' && typeof gl
                   "(globalThis._curSpeed || 1)")
 
 # ---------------------------------------------------------------- visibility
+# NOTE: no setTimeout diagnostics here. Every eval re-registers them on the
+# engine's timer list, and a timer whose JS callback belongs to a context the
+# engine has since destroyed is a dangling call (segfault on fire). Diagnostics
+# go through __modDump on error and the .czn_log breadcrumb instead.
 PRELUDE = (
     "(function () {\n"
     "    function _dump() {\n"
@@ -1162,7 +1256,6 @@ PRELUDE = (
     "        } catch (e2) { }\n"
     "    }\n"
     "    globalThis.__modDump = _dump;\n"
-    "    if (typeof setTimeout === 'function') { setTimeout(_dump, 2000); setTimeout(_dump, 8000); }\n"
     "})();\n"
 )
 CATCH = (
@@ -1186,7 +1279,7 @@ assert ")JS" not in out, "raw-string terminator collision"
 # ---------------------------------------------------------------- asserts
 left = re.findall(r"_SPEED_LEVELS|_speedIdx|_speedCustom", out)
 assert not left, "old speed-model refs remain: %d" % len(left)
-for need in ["_cznAttachUI", "__cznBootTick", "registerService", "_toggleCardSkip",
+for need in ["_cznAttachUI", "__cznBootTick", "__cznArmDriver", "registerService", "_toggleCardSkip",
              "addEventListenerWithFixedPriority", "getLocation",
              "function _onTouchBegan(p)", "function _onTouchEnded(p)",
              "_cznRefreshUI", "_buildCapsule", "_buildPanel", "_buildEdit",

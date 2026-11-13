@@ -94,6 +94,8 @@ static volatile long g_last_try_ms = 0;
 static volatile long g_inject_start_ms = 0;
 static volatile void *g_cur_iso = NULL;
 static volatile int g_watchdog_fired = 0;
+static volatile int g_nocontext = 0;   // asset reads that saw no live JS context
+static volatile int g_last_state = -2; // last layer_state() verdict (log on change)
 static int g_mem_fd = -1;
 static pid_t g_main_pid = 0;       // main-process pid (captured in nativeStart)
 
@@ -372,38 +374,66 @@ static int patch_symbol(struct DynInfo *di, const char *sym, void *hook, void **
 }
 
 // ---------------------------------------------------------------- injection
-static int eval_source(void *iso, void *ctx, const char *src, size_t len,
-                       char *errmsg, int errcap, char *out1) {
+// Is the handle from Isolate::GetCurrentContext() backed by a real context?
+// A Local<Context> is the address of a slot in the current HandleScope, so it
+// is NEVER null even when the isolate has no context entered -- the slot holds
+// null in that case. Handing that empty context to Script::Compile/Run
+// dereferences null inside V8.
+static int ctx_live(void *ctx) {
+    if (!ctx) return 0;
+    return *(volatile uintptr_t *)ctx != 0;
+}
+
+// Evaluates `src` in the isolate's CURRENT context.
+//
+// Everything V8 touches happens inside a HandleScope we open ourselves, and
+// that includes fetching the context: v8::Isolate::GetCurrentContext() returns
+// a Local<Context>, i.e. it ALLOCATES A HANDLE. When this runs from a hooked
+// AAsset_read we are in plain engine C++ with no JS frame on the stack, so
+// there is no HandleScope for this thread and handle creation walks scope data
+// that was never initialised -- a null dereference deep inside V8, on the
+// render thread, at the moment a scene swap starts pulling assets. That is the
+// crash: it only shows up while the GOT hooks stay armed after a successful
+// install (with hooks removed, nothing ever calls into V8 again).
+//
+// *ctx_state (optional) reports whether a real context was found.
+static int eval_source(void *iso, const char *src, size_t len,
+                       char *errmsg, int errcap, char *out1, int *ctx_state) {
     // scope objects: generous fixed buffers (HandleScope=24B, TryCatch<=72B)
     alignas(16) char hs[64];
-    alignas(16) char tc[256];
-    v8_HandleScope_Ctor(hs, iso);
-    v8_TryCatch_Ctor(tc, iso);
+    v8_HandleScope_Ctor(hs, iso);            // must precede any handle use
     void *result = NULL;
-    void *str = v8_String_NewFromUtf8(iso, src, 0 /*kNormal*/, (int)len);
-    if (str) {
-        void *script = v8_Script_Compile(ctx, str, NULL);
-        if (script) result = v8_Script_Run(script, ctx);
-    }
-    // on failure, pull the JS exception text out natively (the engine's
-    // console is silenced -- this is the only reliable channel)
-    if (errmsg && errcap > 0) {
-        errmsg[0] = 0;
-        if (!result) {
-            void *mobj = v8_TryCatch_Message(tc);
-            if (mobj) {
-                void *mstr = v8_Message_Get(mobj);
-                if (mstr)
-                    v8_String_WriteOneByte(mstr, iso, (unsigned char *)errmsg, 0, errcap - 1, 0);
-                errmsg[errcap - 1] = 0;
+    void *ctx = v8_Isolate_GetCurrentContext(iso);
+    int live = ctx_live(ctx);
+    if (ctx_state) *ctx_state = live;
+    if (live) {
+        alignas(16) char tc[256];
+        v8_TryCatch_Ctor(tc, iso);
+        void *str = v8_String_NewFromUtf8(iso, src, 0 /*kNormal*/, (int)len);
+        if (str) {
+            void *script = v8_Script_Compile(ctx, str, NULL);
+            if (script) result = v8_Script_Run(script, ctx);
+        }
+        // on failure, pull the JS exception text out natively (the engine's
+        // console is silenced -- this is the only reliable channel)
+        if (errmsg && errcap > 0) {
+            errmsg[0] = 0;
+            if (!result) {
+                void *mobj = v8_TryCatch_Message(tc);
+                if (mobj) {
+                    void *mstr = v8_Message_Get(mobj);
+                    if (mstr)
+                        v8_String_WriteOneByte(mstr, iso, (unsigned char *)errmsg, 0, errcap - 1, 0);
+                    errmsg[errcap - 1] = 0;
+                }
             }
         }
+        // the installed script returns a 1-char JS string ("0"/"1"); hand the
+        // first byte back to the caller for state dispatch
+        if (out1 && result)
+            v8_String_WriteOneByte(result, iso, (unsigned char *)out1, 0, 1, 0);
+        v8_TryCatch_Dtor(tc);
     }
-    // the installed script returns a 1-char JS string ("0"/"1"); hand the
-    // first byte back to the caller for state dispatch
-    if (out1 && result)
-        v8_String_WriteOneByte(result, iso, (unsigned char *)out1, 0, 1, 0);
-    v8_TryCatch_Dtor(tc);
     v8_HandleScope_Dtor(hs);
     return result != NULL;
 }
@@ -454,9 +484,84 @@ static const struct HookDef kHooks[] = {
     { "AAssetManager_open",  (void *)hook_AAssetManager_open,  (void **)&orig_AAssetManager_open },
 };
 
+// ---------------------------------------------------------------- flags
+// Runtime feature mask, read from <files>/czn_flags (hex). Absent file means
+// everything on. The JS side reads the same file for its own bits (0x100 UI,
+// 0x200 tick, 0x400 timeScale guard, 0x800 prototype hooks, 0x1000 touch), so
+// a crash can be bisected on a device without a rebuild.
+#define F_EVAL        (1u << 0)   // evaluate the JS bundle at all
+#define F_KEEP_HOOKS  (1u << 1)   // keep the GOT hooks armed after install
+static volatile unsigned g_flags = 0xFFFFFFFFu;
+
+static void flags_load() {
+    const char *pkg = g_pkg[0] ? g_pkg : TARGET_PKG;
+    char path[192];
+    snprintf(path, sizeof(path),
+             "/storage/emulated/0/Android/data/%s/files/czn_flags", pkg);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;                    // no file: keep the all-on default
+    char buf[64];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    unsigned v = 0;
+    int any = 0;
+    for (int i = 0; i < n; i++) {
+        char c = buf[i];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else continue;
+        v = (v << 4) | (unsigned)d;
+        any = 1;
+    }
+    if (any) g_flags = v;
+    LOGI("flags=0x%x", g_flags);
+}
+
 // ---------------------------------------------------------------- injection
+// Health probe, run inside the current context:
+//   '0' = this context has no layer at all  -> full re-inject
+//   '1' = layer present and its tick driver is parented to the running scene
+//   '2' = layer present but the driver is gone -- a scene swap destroyed the
+//         action it lived on. Re-arm it in place; do NOT re-evaluate the whole
+//         bundle (that resets the UI, the config and the tick counter).
+// The bundle stamps globalThis.__cznCtxId as its very first statement, so the
+// marker also proves the layer is installed in THIS context. Comparing V8
+// contexts natively cannot do that job: a Local<Context> is a HandleScope slot
+// address, so the same context reports a different value on every call.
+static const char kProbeJs[] =
+    "(function(){try{"
+    "if(typeof globalThis.__cznCtxId!=='number')return '0';"
+    "var d=cc.Director.getInstance();"
+    "var s=d.getRunningScene?d.getRunningScene():null;"
+    "if(!s)return '1';"
+    "var n=globalThis.__cznTickNode;"
+    "if(n&&n.getParent&&n.getParent()===s)return '1';"
+    "return '2';"
+    "}catch(e){return '0';}})()";
+
+static const char kRepairJs[] =
+    "(function(){try{return (typeof globalThis.__cznArmDriver==='function')"
+    "?(globalThis.__cznArmDriver()||'0'):'0';}catch(e){return '0';}})()";
+
+// Probe result: 0 = no layer, 1 = healthy, 2 = driver needs re-arming,
+// -1 = no JS context entered on this thread (nothing was evaluated).
+static int layer_state(void *iso) {
+    char r[2] = {0, 0};
+    int have_ctx = 0;
+    int ok = eval_source(iso, kProbeJs, sizeof(kProbeJs) - 1, NULL, 0, r, &have_ctx);
+    if (!have_ctx) return -1;
+    if (!ok) return 0;                       // probe threw: assume absent
+    if (r[0] == '1') return 1;
+    if (r[0] == '2') return 2;
+    return 0;
+}
+
 static void maybe_inject() {
-    if (g_state != ST_ARMED) return;
+    if (g_state != ST_ARMED && g_state != ST_DONE) return;
     // Fork children inherit the patched GOT (and this static state) via COW,
     // but only the main process may inject. The main pid is captured in
     // nativeStart(); a fork child's getpid() differs, so it bails here. This
@@ -476,8 +581,6 @@ static void maybe_inject() {
         if (!iso) break;
         long now = now_ms();
         if (now - g_last_try_ms < 500) break;   // throttle real attempts only
-        g_last_try_ms = now;
-        g_inject_start_ms = now;
         // Isolate validation: with pointer compression the real Isolate sits
         // at the 4GB-aligned cage base -- exact equality. Without it (this
         // engine), verify the address is readable (/proc/self/mem, exact).
@@ -486,15 +589,51 @@ static void maybe_inject() {
         } else if (!addr_readable((uintptr_t)iso)) {
             break;
         }
+        // NOTE: no Isolate::GetCurrentContext() here. It allocates a handle, and
+        // an asset read runs outside any JS frame -- see eval_source().
+        if (g_state == ST_DONE) {
+            int st = layer_state(iso);
+            if (st < 0) {
+                // Asset reads from native scene-loading code run with no JS
+                // context entered. Never touch V8 in that state; just count it.
+                int n = __sync_add_and_fetch(&g_nocontext, 1);
+                if (n <= 5 || (n % 40) == 0) LOGI("skip: no V8 context here (#%d)", n);
+                break;
+            }
+            g_last_try_ms = now;
+            if (st != g_last_state) {
+                g_last_state = st;
+                LOGI("layer state -> %d", st);
+            }
+            if (st == 1) break;                     // healthy
+            if (st == 2) {
+                // The tick driver died with its scene. Re-arm it in the current
+                // scene; the layer itself (config, UI code) stays untouched.
+                char rr[2] = {0, 0};
+                if (eval_source(iso, kRepairJs, sizeof(kRepairJs) - 1,
+                                NULL, 0, rr, NULL) && rr[0] == '1') {
+                    LOGI("tick driver re-armed on the running scene");
+                    status_write("driver re-armed");
+                }
+                break;                              // retry on the next read
+            }
+            // st == 0: this context has no layer (engine rebuilt it)
+            LOGI("JS layer absent in current context; re-injecting");
+            status_write("re-inject: layer absent in context");
+        } else {
+            g_last_try_ms = now;
+        }
+        g_inject_start_ms = now;
         g_cur_iso = iso;
-        void *ctx = v8_Isolate_GetCurrentContext(iso);
-        if (!ctx) break;
+
         // ONE throw-proof install script (pure definitions + scheduler frame
         // wrap; zero engine mutation at eval time). Its string result
         // carries state: "1"=installed, "0"=engine not ready (retry later).
         char emsg[384] = {0};
         char r[2] = {0, 0};
-        if (!eval_source(iso, ctx, kModJs, sizeof(kModJs) - 1, emsg, sizeof(emsg), r)) {
+        int have_ctx = 0;
+        if (!eval_source(iso, kModJs, sizeof(kModJs) - 1, emsg, sizeof(emsg), r, &have_ctx)) {
+            if (!have_ctx) break;            // no JS context here: retry later
             g_state = ST_FAILED;
             if (g_watchdog_fired) {
                 LOGE("stage1 terminated by watchdog");
@@ -511,7 +650,12 @@ static void maybe_inject() {
             g_state = ST_DONE;
             LOGI("stage1 ok (frame-driven boot armed)");
             status_write("stage1 ok; boot runs on engine frame");
-            restore_all_slots();                 // handlers never run again
+            // Keep the GOT hooks armed (F_KEEP_HOOKS): if the engine later
+            // rebuilds its V8 context, maybe_inject() sees that the layer is
+            // gone and re-installs it instead of stranding the UI. The hooks
+            // pass through genuinely, so the residual cost is a few checks per
+            // asset read. Clear the bit to get the old single-shot behaviour.
+            if (!(g_flags & F_KEEP_HOOKS)) restore_all_slots();
         }
         // r[0] == '0': engine not ready yet -- stay armed, retry throttled
     } while (0);
@@ -521,6 +665,13 @@ static void maybe_inject() {
 
 // ---------------------------------------------------------------- worker
 static void *worker_main(void *) {
+    flags_load();
+    if (!(g_flags & F_EVAL)) {
+        LOGE("flags: eval disabled -- inert");
+        status_write("flags: eval off (inert)");
+        g_state = ST_FAILED;
+        return NULL;
+    }
     char lib_path[256] = {0};
     // 1) wait for libssr.so -- this IS the game filter (only the game has
     //    this library). 15s early exit for non-game processes.
