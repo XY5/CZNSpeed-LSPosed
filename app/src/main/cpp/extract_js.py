@@ -397,13 +397,18 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
     var BTN_W = 60, BTN_H = CAP_H;// ball size / touch hot-zone (H matches capsule)
     var DOTS_X = 124, ARR_L_X = 19, NUM_X = 56, ARR_R_X = 93; // capsule inner x
     var BALL_A = 70;               // collapsed ball alpha (node opacity stays 255)
-    var PAN_W = 304, PAN_H = 220;  // more panel size
+    var PAN_W = 304, PAN_H = 288;  // more panel size
     var ED_W = 320, ED_H = 432;    // edit dialog size
     var GAP = 14;                  // panel gap under the capsule
+    var HOT_W = 100, HOT_H = 100, HOT_M = 8; // ghost hot-zone (bottom-left corner)
+    var HOLD_MS = 1500;            // hold the ball this long to hide
+    var REV_HOLD_MS = 700;         // hold the ghost this long to show again
+    var TAP_GAP = 700;             // triple-tap window (max gap between taps)
+    var GHOST_DEBUG = false;       // TEMP: paint the hot-zone red for eyeballing
 
     var ui = null;
     globalThis._cznUI = null;
-    var mode = 'collapsed';        // collapsed | expanded | more | edit
+    var mode = 'collapsed';        // collapsed | expanded | more | edit | hidden
     var speedIdx = 0;
     var R = [];
     var drag = null;
@@ -411,6 +416,12 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
     var editBuf = '';
     var _lastActual = null, _lastPaused = null, _lastLevelsKey = '';
     var _cznProbed = false;
+    // hidden state: nothing is drawn, only an invisible corner hot-zone stays
+    // alive so the user can get the UI back (never persisted on purpose).
+    var _hidden = false, _ghost = null, _gprev = null;
+    var _hold = null, _rev = null;   // { t0 } long-press trackers (wall clock)
+    var _tapT = 0, _tapN = 0;        // triple-tap counter
+    var _ignoreUntil = 0;            // swallow the release that restores the UI
 
     // ---- engine / helpers ------------------------------------------------
     function _dir() { return cc.Director.getInstance(); }
@@ -625,6 +636,79 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
         _paintBall();
         _pinBallOpaque();
     }
+
+    // ---- hidden state ----------------------------------------------------
+    // Wall clock on purpose: 00_timers scales setTimeout by the game speed, so
+    // a 1.5s hold would fire in 75ms at 20x. Date.now() is never scaled.
+    function _now() { try { return Date.now(); } catch (e) { return 0; } }
+    function _killGhost() {
+        if (_ghost) { try { _ghost.removeFromParent(); } catch (e) { } _ghost = null; }
+    }
+    function _buildGhost() {
+        _killGhost();
+        if (!ui || !ui.scene) return;
+        // an empty widget with a size but no children: nothing is drawn, yet
+        // hitTest still passes on its contentSize, so it can take touches.
+        var node = _mkContainer(HOT_W, HOT_H, HOT_M, HOT_M, 99995);
+        if (!node) return;
+        try { if (typeof node.setSwallowTouches === 'function') node.setSwallowTouches(false); } catch (e) { }
+        if (GHOST_DEBUG) {
+            // TEMP: draw the hot-zone so its position can be eyeballed.
+            // Children do not affect the widget's hitTest (that uses its own
+            // contentSize), so this is purely visual.
+            _layer(node, _color(230, 40, 40, 130), HOT_W, HOT_H, 0, 0, 1);
+            _label(node, 'H ' + HOT_W + 'x' + HOT_H, 16, HOT_W / 2, HOT_H / 2, 2, _color(255, 255, 255, 255));
+        }
+        _ghost = node;
+        R = [];
+        _reg('ghost', HOT_M, HOT_M, HOT_W, HOT_H);
+    }
+    // TEMP: a non-interactive twin of the hot-zone, always on screen while
+    // GHOST_DEBUG is on, so its position can be checked without hiding first.
+    function _killGhostPreview() {
+        if (_gprev) { try { _gprev.removeFromParent(); } catch (e) { } _gprev = null; }
+    }
+    function _buildGhostPreview() {
+        _killGhostPreview();
+        if (!GHOST_DEBUG || !ui || !ui.scene) return;
+        var n = _mkContainer(HOT_W, HOT_H, HOT_M, HOT_M, 99996);
+        if (!n) return;
+        try { if (typeof n.setTouchEnabled === 'function') n.setTouchEnabled(false); } catch (e) { }
+        _layer(n, _color(230, 40, 40, 130), HOT_W, HOT_H, 0, 0, 1);
+        _label(n, 'H ' + HOT_W + 'x' + HOT_H, 16, HOT_W / 2, HOT_H / 2, 2, _color(255, 255, 255, 255));
+        _gprev = n;
+    }
+    function _enterHidden() {
+        if (!ui || !ui.btn) return;
+        _clearOverlayNodes();
+        _killGhost();
+        _hold = null; _rev = null; _tapN = 0; _tapT = 0;
+        drag = null;
+        mode = 'hidden';
+        _hidden = true;
+        R = [];
+        try { ui.btn.setVisible(false); } catch (e) { }
+        try { if (typeof ui.btn.setTouchEnabled === 'function') ui.btn.setTouchEnabled(false); } catch (e) { }
+        _buildGhost();
+        try { globalThis._crumb('ui hidden'); } catch (e) { }
+    }
+    function _exitHidden() {
+        _hidden = false;
+        _killGhost();
+        _hold = null; _rev = null; _tapN = 0; _tapT = 0;
+        if (!ui || !ui.btn) { mode = 'collapsed'; return; }
+        try { ui.btn.setVisible(true); } catch (e) { }
+        try { if (typeof ui.btn.setTouchEnabled === 'function') ui.btn.setTouchEnabled(true); } catch (e) { }
+        _goCollapsed();
+        _lastActual = null; _lastPaused = null;
+        _ignoreUntil = _now() + 300;
+        try { globalThis._crumb('ui shown'); } catch (e) { }
+    }
+    function _tickHolds() {
+        var now = _now();
+        if (!_hidden && _hold && mode === 'collapsed' && (now - _hold.t0) >= HOLD_MS) { _hold = null; _enterHidden(); return; }
+        if (_hidden && _rev && (now - _rev.t0) >= REV_HOLD_MS) { _rev = null; _exitHidden(); }
+    }
     function _buildCapsule() {
         _clearOverlayNodes();
         if (!ui || !ui.btn) return;
@@ -665,26 +749,31 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
         refs.panelBig = _label(node, _isPaused(a) ? '0' : _fmt(a), 26, PAN_W - pad - 44, PAN_H - pad - 22, 1);
         _label(node, '倍', 14, PAN_W - pad - 12, PAN_H - pad - 22, 1, _color(200, 200, 208, 255));
         var L = _levels(), n = L.length;
-        var segW = (PAN_W - pad * 2 - 3 * (n - 1)) / n, segH = 40, segY = 116;
+        var segW = (PAN_W - pad * 2 - 3 * (n - 1)) / n, segH = 40, segY = 184;
         for (var i = 0; i < n; i++) {
             var sx = pad + i * (segW + 3);
             var act = (i === speedIdx);
             _layer(node, act ? _color(83, 74, 183, 255) : _color(42, 42, 51, 255), segW, segH, sx, segY, 2);
             _label(node, _fmt(L[i]), 15, sx + segW / 2, segY + segH / 2, 3);
         }
-        var ty = 64;
+        var ty = 132;
         _label(node, '跳过动画', 15, pad + 30, ty + 22, 1, _color(200, 200, 208, 255));
         var swX = PAN_W - pad - 52, swW = 40, swH = 24, swY = ty + 10;
         _layer(node, globalThis._animSkipEnabled ? _color(83, 74, 183, 255) : _color(58, 58, 66, 255), swW, swH, swX, swY, 2);
         _layer(node, _color(255, 255, 255, 255), 16, 16, swX + (globalThis._animSkipEnabled ? 20 : 4), swY + 4, 3);
-        var ey = 12;
+        var ey = 80;
         _layer(node, _color(42, 42, 51, 255), PAN_W - pad * 2, 44, pad, ey, 2);
         _label(node, '编辑档位', 16, PAN_W / 2, ey + 22, 3);
+        var hy = 12;
+        _layer(node, _color(42, 42, 51, 255), PAN_W - pad * 2, 56, pad, hy, 2);
+        _label(node, '隐藏悬浮窗', 15, PAN_W / 2, hy + 36, 3, _color(245, 245, 248, 255));
+        _label(node, '左下角连点三次 / 长按恢复', 12, PAN_W / 2, hy + 17, 3, _color(150, 150, 160, 255));
         R = [];
         _regCap();
         for (var j = 0; j < n; j++) _reg('seg' + j, panX + pad + j * (segW + 3), panY + segY, segW, segH);
         _reg('skip', panX + swX, panY + swY, swW, swH);
         _reg('edit', panX + pad, panY + ey, PAN_W - pad * 2, 44);
+        _reg('hide', panX + pad, panY + hy, PAN_W - pad * 2, 56);
         mode = 'more';
         _pinBallOpaque();
     }
@@ -735,13 +824,25 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
         var id = _hit(p.x, p.y);
         _tDiag('began', id, p);
         if (id === null) return false;
-        if (mode === 'collapsed' && id === 'ball') drag = { start: p, moved: false };
+        if (_hidden) {
+            // Never swallow while hidden: the game still gets the touch, we
+            // only count taps and start the hold timer.
+            if (id === 'ghost') {
+                var now = _now();
+                if (now > 0 && _tapT > 0 && (now - _tapT) <= TAP_GAP) _tapN++; else _tapN = 1;
+                _tapT = now;
+                _rev = { t0: now };
+                if (_tapN >= 3) { _tapN = 0; _rev = null; _exitHidden(); }
+            }
+            return false;
+        }
+        if (mode === 'collapsed' && id === 'ball') { drag = { start: p, moved: false }; _hold = { t0: _now() }; }
         else drag = null;
         return true;
     }
     function _onTouchMoved(p) {
         if (drag && mode === 'collapsed' && ui && ui.btn) {
-            if (!drag.moved && Math.abs(p.x - drag.start.x) + Math.abs(p.y - drag.start.y) > 12) drag.moved = true;
+            if (!drag.moved && Math.abs(p.x - drag.start.x) + Math.abs(p.y - drag.start.y) > 12) { drag.moved = true; _hold = null; }
             if (drag.moved) {
                 var W = _win();
                 globalThis._btnPosX = Math.round(Math.max(4, Math.min(W.width - BTN_W - 4, p.x - BTN_W / 2)));
@@ -783,7 +884,20 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
         _lastActual = null; _lastPaused = null; _lastLevelsKey = arr.join(',');
     }
     function _onTouchEnded(p) {
+        if (_hidden) {
+            var rh = _rev ? (_now() - _rev.t0) : 0;
+            _rev = null; drag = null; _hold = null;
+            // A 0.7s hold is shorter than one tick (0.5s), so the release must
+            // be able to finish the hold itself instead of waiting for a tick.
+            if (rh >= REV_HOLD_MS) _exitHidden();
+            return;
+        }
+        if (_ignoreUntil && _now() < _ignoreUntil) { _ignoreUntil = 0; drag = null; return; }
         var wasDrag = drag && drag.moved; drag = null;
+        var held = _hold ? (_now() - _hold.t0) : 0;
+        _hold = null;
+        // the tick may not have run yet: honour a completed hold right here
+        if (!wasDrag && held >= HOLD_MS) { _enterHidden(); return; }
         if (wasDrag) { try { globalThis._saveSpeedConfig(); } catch (e) { } _paintBall(); return; }
         var id = _hit(p.x, p.y);
         _tDiag('ended', id, p);
@@ -806,6 +920,7 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
             if (id === 'r') { _step(1); _buildPanel(); return; }
             if (id === 'skip') { try { if (typeof globalThis._toggleCardSkip === 'function') globalThis._toggleCardSkip(); } catch (e) { } _buildPanel(); return; }
             if (id === 'edit') { editBuf = _levels().join(','); _buildEdit(); return; }
+            if (id === 'hide') { _enterHidden(); return; }
             if (id && id.indexOf('seg') === 0) { var si = parseInt(id.substring(3), 10); var Lv = _levels(); if (!isNaN(si) && Lv[si] !== undefined) { speedIdx = si; _apply(Lv[si]); } _buildPanel(); return; }
             if (id === null) { _goCollapsed(); return; }
             return;
@@ -836,9 +951,15 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
     }
     function _attach(scene) {
         if (!scene) return { ok: false, why: 'no-scene' };
-        if (ui && ui.btn && ui.btn.getParent() === scene) { _paintBall(); return { ok: true }; }
+        if (ui && ui.btn && ui.btn.getParent() === scene) {
+            if (_hidden) _enterHidden(); else _paintBall();
+            _buildGhostPreview();
+            return { ok: true };
+        }
         try {
             _clearOverlayNodes();
+            _killGhost();
+            _killGhostPreview();
             var useCcui = _ccuiAvailable();
             var node = null;
             if (useCcui) {
@@ -858,8 +979,8 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
                 ui.path = 'event-manager';
             }
             speedIdx = _normIdx(_findIdx(globalThis._curSpeed));
-            _paintBall();
-            _pinBallOpaque();
+            if (_hidden) { _enterHidden(); } else { _paintBall(); _pinBallOpaque(); }
+            _buildGhostPreview();
             _probeOnce();
             return { ok: true };
         } catch (e) { return { ok: false, why: 'build:' + e }; }
@@ -869,6 +990,7 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
     globalThis._applySpeed = _apply;
     globalThis._updateSpeedLabel = function () {
         try {
+            if (_hidden) return;
             if (mode === 'collapsed') _paintBall();
             _lastActual = null; _lastPaused = null;
             globalThis._cznRefreshUI();
@@ -876,6 +998,8 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
     };
     globalThis._cznRefreshUI = function () {
         try {
+            _tickHolds();
+            if (_hidden) return;
             if (!ui || !ui.btn) return;
             var L = _levels();
             var key = L.join(',');
@@ -1066,7 +1190,8 @@ for need in ["_cznAttachUI", "__cznBootTick", "registerService", "_toggleCardSki
              "addEventListenerWithFixedPriority", "getLocation",
              "function _onTouchBegan(p)", "function _onTouchEnded(p)",
              "_cznRefreshUI", "_buildCapsule", "_buildPanel", "_buildEdit",
-             "_parseLevels", "_paintBall", "_crumb"]:
+             "_parseLevels", "_paintBall", "_crumb",
+             "_enterHidden", "_exitHidden", "_buildGhost", "_tickHolds"]:
     assert need in out, "missing: " + need
 assert "__app.on" not in out and "registerPage" not in out, "dead framework members remain"
 assert "czn_speed v" not in out and "czn-speed v" not in out, "version string leaked"

@@ -95,7 +95,7 @@ static volatile long g_inject_start_ms = 0;
 static volatile void *g_cur_iso = NULL;
 static volatile int g_watchdog_fired = 0;
 static int g_mem_fd = -1;
-static int g_is_main_proc = -1;    // -1 unknown, 0 fork-child, 1 main
+static pid_t g_main_pid = 0;       // main-process pid (captured in nativeStart)
 
 static uintptr_t g_engine_base = 0;
 static uintptr_t g_v8_cage = 0;    // advisory: only set on ptr-compression builds
@@ -112,31 +112,6 @@ static long now_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
-}
-
-// raw open/read -- never fopen (those are our own hook points)
-static int read_file_head(const char *path, char *out, int cap) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    ssize_t n = read(fd, out, cap - 1);
-    close(fd);
-    if (n <= 0) return -1;
-    out[n] = 0;
-    return (int)n;
-}
-
-// main process = many threads; the engine's fork-child watchdog has exactly 1
-static int is_main_process() {
-    if (g_is_main_proc >= 0) return g_is_main_proc;
-    g_is_main_proc = 0;
-    char buf[2048];
-    if (read_file_head("/proc/self/status", buf, sizeof(buf) - 1) < 0) return 0;
-    const char *p = strstr(buf, "Threads:");
-    if (p) {
-        int t = atoi(p + 8);
-        g_is_main_proc = (t > 1) ? 1 : 0;
-    }
-    return g_is_main_proc;
 }
 
 // ---------------------------------------------------------------- maps scan
@@ -482,18 +457,27 @@ static const struct HookDef kHooks[] = {
 // ---------------------------------------------------------------- injection
 static void maybe_inject() {
     if (g_state != ST_ARMED) return;
-    long now = now_ms();
-    long last = g_last_try_ms;
-    if (now - last < 500) return;                // throttle attempts
-    g_last_try_ms = now;
-    if (g_is_main_proc < 0 && !is_main_process()) return;  // fork-child: never
-    if (g_is_main_proc == 0) return;
+    // Fork children inherit the patched GOT (and this static state) via COW,
+    // but only the main process may inject. The main pid is captured in
+    // nativeStart(); a fork child's getpid() differs, so it bails here. This
+    // replaces the old /proc/self/status thread-count heuristic, which could
+    // misclassify the main process on a cold start (Threads == 1 for an
+    // instant) and then cache the wrong verdict forever, intermittently
+    // leaving the module unloaded.
+    if (g_main_pid && getpid() != g_main_pid) return;
 
     if (__sync_lock_test_and_set(&g_injecting, 1)) return; // reentry guard
-    g_inject_start_ms = now;
     do {
         void *iso = v8_Isolate_GetCurrent();
+        // Asset reads fire on both the V8 (main) thread and async IO threads.
+        // Only a thread holding a V8 isolate can inject; bail on IO threads
+        // WITHOUT consuming the throttle budget, so a burst of IO-thread reads
+        // can never starve the one V8-thread trigger that matters.
         if (!iso) break;
+        long now = now_ms();
+        if (now - g_last_try_ms < 500) break;   // throttle real attempts only
+        g_last_try_ms = now;
+        g_inject_start_ms = now;
         // Isolate validation: with pointer compression the real Isolate sits
         // at the 4GB-aligned cage base -- exact equality. Without it (this
         // engine), verify the address is readable (/proc/self/mem, exact).
@@ -648,7 +632,8 @@ Java_com_czn_mod_Main_nativeStart(JNIEnv *env, jclass, jstring pkg) {
             env->ReleaseStringUTFChars(pkg, s);
         }
     }
-    LOGI("nativeStart pkg=%s", g_pkg[0] ? g_pkg : TARGET_PKG);
+    g_main_pid = getpid();
+    LOGI("nativeStart pkg=%s pid=%d", g_pkg[0] ? g_pkg : TARGET_PKG, (int)g_main_pid);
     pthread_t tid;
     if (pthread_create(&tid, NULL, worker_main, NULL) == 0)
         pthread_detach(tid);
