@@ -157,15 +157,16 @@ function _collectEntities() {
                 // getEntityOfUID 是唯一不被 V8 IC 绕过的 hook 点
                 // selectCardRSpark 在选牌时调用 EntityManager.getEntityOfUID(char_id)
                 // 检查调用栈来判断当前是否处于 R-Spark 流程
-                if (globalThis._animSkipEnabled) {
+                // 守卫期间不必再采样（已经在 1x 了），省掉每次调用的 stack 开销
+                if (!globalThis._sparkGuardActive) {
                     _getEntityCallCount++;
                     try {
                         var stack = new Error().stack;
                         // 诊断: 前10次调用记录 stack 前150字符
-                        if (_getEntityCallCount <= 10) {
+                        if (globalThis._animSkipEnabled && _getEntityCallCount <= 10) {
                             globalThis._speedLog('[EM-CALL#' + _getEntityCallCount + '] uid=' + uid + ' stack=' + (stack ? stack.substring(0, 150).replace(/\n/g, ' | ') : 'N/A'));
                         }
-                        if (!globalThis._sparkGuardActive && stack && (stack.indexOf('selectCardRSpark') >= 0 || stack.indexOf('selectCardSpark') >= 0)) {
+                        if (stack && (stack.indexOf('selectCardRSpark') >= 0 || stack.indexOf('selectCardSpark') >= 0)) {
                             globalThis._speedLog('[SPARK] >>> R-SPARK GUARD ON via M5:stack-trace (uid=' + uid + ')');
                             globalThis._speedLog('[SPARK] stack: ' + stack.substring(0, 300));
                             globalThis._guardOn(15000, 'stack-rspark');
@@ -196,174 +197,30 @@ var _protoHooked = false;
 var _origProtoPlayAnimation = null;
 var _origProtoSetAnimation = null;
 var _origProtoGetAnimLen = null;
-var _origProtoShowSparkEffect = null;
-var _origProtoCheckSparkEffect = null;
 var _playAnimLogCount = 0;
 var _MAX_PLAY_LOGS = 200;
-// 灵光一闪 exemption — 由 showSparkEffect prototype hook 驱动
-// 守卫状态统一由 05_guard 管理：_guardOn/_guardOff/_guardExtend，
-// 这里不再自己持有 timer（旧的共享 _sparkGuardTimer 会被别的路径 clearTimeout 掉）
-var _battleEventHooked = false;
-var _sparkCallCount = 0;  // showSparkEffect 调用次数
-var _MAX_SPARK_LOGS = 100;
-var _checkSparkFlag = false;  // checkSparkEffect 返回 true 时设置
-var _sparkStackLogCount = 0;  // v15: stack trace 日志计数
+// 守卫只剩两条"选牌"触发点：06 的选牌弹窗 hook，
+// 以及本文件 getEntityOfUID 里的 selectCardRSpark 栈检测。
 var _getEntityCallCount = 0;  // v15: getEntityOfUID 调用计数
-// v17: Buff/Collapse guard — 工厂化
-var _guardOrigFuncs = {};   // {methodName: origFunction}
-var _guardCounters = { buff: 0, collapse: 0 };
 
-// v17 Guard Hook 工厂 — defineProperty accessor 包装原型方法
-// 触发时激活 _sparkGuardActive，setTimeout 后自动恢复
-// mode='on': 标准守卫（激活+超时恢复）  mode='off': 关闭守卫（仅当已激活时生效）
-function _hookGuardMethod(proto, name, ownKeys, cfg, depth, ctorName) {
-    if (ownKeys.indexOf(name) < 0) return false;
-    if (typeof proto[name] !== 'function' || _guardOrigFuncs[name]) return false;
-    _guardOrigFuncs[name] = proto[name];
-    var origFn = _guardOrigFuncs[name];
-    var logPrefix = cfg.logPrefix;
-    var counterKey = cfg.counterKey;
-    var timeoutMs = cfg.timeoutMs;
-    var mode = cfg.mode || 'on';  // 'on' | 'off'
+// 现在只剩两条"选牌"守卫：
+//   1) 06 的 RSparkManager.createRSparkSelectPopup —— 选牌弹窗打开时 3s
+//   2) 本文件 getEntityOfUID 的 selectCardRSpark 调用栈 —— 选牌动作 15s
+// buff / debuff / 崩坏 / cut-in / 必杀 / lead / 崩溃 / spark 特效的触发点
+// 全部移除：它们各自依赖未经验证的事件名和方法名，误触发一次就是整段战斗
+// 被压回 1x，而收益只有"看清动画"。等真机日志确认了事件名再逐个加回来。
 
-    var makeOnWrapper = function (self, origFn) {
-        return function _guardOnWrap() {
-            if (globalThis._animSkipEnabled) {
-                _guardCounters[counterKey]++;
-                globalThis._speedLog('[' + logPrefix + '] >>> ON: ' + name + ' #' + _guardCounters[counterKey] + ' (timeout: ' + timeoutMs + 'ms)');
-                globalThis._guardOn(timeoutMs, name);
-            }
-            return origFn.apply(self, arguments);
-        };
-    };
-    var makeOffWrapper = function (self, origFn) {
-        return function _guardOffWrap() {
-            if (globalThis._animSkipEnabled && globalThis._sparkGuardActive) {
-                globalThis._speedLog('[' + logPrefix + '] ' + name + ' → schedule OFF ' + timeoutMs + 'ms');
-                globalThis._guardExtend(timeoutMs, name);
-            }
-            return origFn.apply(self, arguments);
-        };
-    };
-    var makeWrapper = (mode === 'off') ? makeOffWrapper : makeOnWrapper;
 
-    try {
-        Object.defineProperty(proto, name, {
-            get: function () { return makeWrapper(this, origFn); },
-            configurable: true,
-            enumerable: true
-        });
-    } catch (e) {
-        // defineProperty 失败时 fallback 到直接赋值
-        proto[name] = function () { return makeWrapper(this, origFn).apply(this, arguments); };
-    }
-    globalThis._speedLog('[PROTO] Hooked ' + name + ' on L' + depth + ':' + ctorName);
-    return true;
-}
 
-// v14: 多信号 R-Spark 检测函数 (M1-M4 仍作为 showSparkEffect accessor 的辅助检测)
-// 返回检测方法名 (string) 或 false
-function _detectRSpark(entity, args) {
-    var a2_val = args.length > 0 ? args[0] : undefined;
-    var isShow = !!a2_val;
-    if (!isShow) return false;  // 移除特效的调用，不是 R-Spark
-
-    // M1: entity 自身的 ready_spark (unit_card 对象可能有)
-    try {
-        if (entity.ready_spark || entity.ready_red_spark) return 'M1:this.ready_spark';
-    } catch (e) { }
-
-    // M2: 参数类型检查
-    // selectCardRSpark 传递 ready_spark 数据(可能是卡牌ID/对象,非 boolean)
-    // 普通 spark 传递 true/false
-    try {
-        if (typeof a2_val !== 'boolean' && a2_val !== 1 && a2_val !== 0) {
-            return 'M2:non-boolean-arg(' + typeof a2_val + ':' + String(a2_val).substring(0, 30) + ')';
-        }
-    } catch (e) { }
-
-    // M3: checkSparkEffect 在最近调用中返回了 true
-    if (_checkSparkFlag) {
-        _checkSparkFlag = false;
-        return 'M3:checkSparkEffect';
-    }
-
-    // M4: BattleHelper.battle_stage 路径检查
-    try {
-        var bh = globalThis['BattleHelper'];
-        if (bh) {
-            // 检查 BattleHelper 的静态属性
-            var bs = bh.battle_stage || bh.prototype.battle_stage;
-            if (bs && bs.logic) {
-                // selectCardRSpark 设置 this.cards = true  
-                if (bs.logic.cards === true) return 'M4:logic.cards=true';
-            }
-        }
-    } catch (e) { }
-
-    return false;
-}
-
-// v16: Hook BattleEventManager.emit 使用 Object.defineProperty accessor
-// 字节码证实: emit(type, detail, opts) → new EventBase(type, opts, detail) → this.dispatchEvent()
-// Object.defineProperty accessor 在 showSparkEffect 上已证明可绕过 V8 IC (sparkCalls=89)
-// 
-// 保护的事件类型:
-//   ON_SPARK_START / ON_SPARK_END   — 灵光一闪 (spark card selection)
-//   ADD_CS / CHANGE_CS              — Buff/状态施加
-//   BREAK_IN                        — 崩溃动画
-//   ON_CUTIN_START / ON_CUTIN_END   — 演出动画
-//   ON_START_FATAL_ATTACK / ON_END_FATAL_ATTACK — 必杀技
-
-var _bemEmitCallCount = 0;
-var _bemDispatchCallCount = 0;
-var _MAX_BEM_LOGS = 200;
-
-// 需要保护的事件 → guard 持续时间(ms), 0 = 由对应 END 事件关闭
-var _guardEvents = {
-    'ON_SPARK_START': 0,          // 由 ON_SPARK_END 关闭
-    'ON_CUTIN_START': 0,          // 由 ON_CUTIN_END 关闭
-    'ON_START_FATAL_ATTACK': 0,   // 由 ON_END_FATAL_ATTACK 关闭
-    'ON_LEAD_START': 0,           // 由 ON_LEAD_END 关闭
-    'ADD_CS': 3000,               // Buff 施加 — 3秒后自动恢复
-    'BREAK_IN': 4000              // 崩溃 — 4秒后自动恢复
-};
-var _guardEndEvents = {
-    'ON_SPARK_END': true,
-    'ON_CUTIN_END': true,
-    'ON_END_FATAL_ATTACK': true,
-    'ON_LEAD_END': true
-};
-
-function _checkBemEventGuard(eventType) {
-    var typeStr = '';
-    try {
-        // eventType 可能是 EventBase 对象 (有 .type 属性) 或直接是字符串
-        if (eventType && typeof eventType === 'object' && eventType.type) {
-            typeStr = String(eventType.type);
-        } else {
-            typeStr = String(eventType);
-        }
-    } catch (e) { return; }
-
-    if (!typeStr || !globalThis._animSkipEnabled) return;
-
-    // 检查是否是保护事件 (guard ON)
-    if (_guardEvents.hasOwnProperty(typeStr)) {
-        var duration = _guardEvents[typeStr];
-        // duration 0 = 等对应的 END 事件关闭；06/05 层还有 60s 硬上限兜底
-        globalThis._guardOn(duration, typeStr);
-        globalThis._speedLog('[GUARD] >>> ON: ' + typeStr +
-            (duration > 0 ? ' (' + duration + 'ms)' : ' (until end)'));
-    }
-
-    // 检查是否是结束事件 (guard OFF)
-    if (_guardEndEvents.hasOwnProperty(typeStr)) {
-        // 延迟关闭，确保最后的动画/UI 完成
-        var offDelay = (typeStr === 'ON_SPARK_END') ? 1500 : 800;
-        globalThis._guardExtend(offDelay, typeStr);
-        globalThis._speedLog('[GUARD] <<< scheduling OFF: ' + typeStr + ' in ' + offDelay + 'ms');
-    }
+// 守卫 hook 必须常驻，与"跳过动画"开关无关。
+// 旧实现只在 _toggleCardSkip 的 ON 分支里装原型 hook，于是 skip=0 的玩家
+// 连一个守卫触发点都没有，选牌流程被 05 的 reconcile 直接拉回用户速度。
+function _installGuardHooks() {
+    if (globalThis._fl && !globalThis._fl(0x800)) return false;  // 原型 hook 可被 flags 关掉
+    // 06 的选牌弹窗守卫与跳过开关无关，一并保活
+    try { if (typeof globalThis._ensureGuardsInstalled === 'function') globalThis._ensureGuardsInstalled(); } catch (e) { }
+    if (!_protoHooked) { try { _hookEntityPlayAnimation(true); } catch (e) { } }
+    return _protoHooked;
 }
 
 
@@ -420,86 +277,6 @@ function _hookEntityPlayAnimation(enable) {
                         globalThis._speedLog('[PROTO] Hooked playAnimation on prototype L' + depth + ':' + constructorName);
                     }
 
-                    // === v15: Hook showSparkEffect via Object.defineProperty accessor ===
-                    // v14 的直接赋值被 V8 IC 绕过，v15 改用 accessor property
-                    var hasShowSpark = ownKeys.indexOf('showSparkEffect') >= 0;
-                    if (hasShowSpark && typeof proto.showSparkEffect === 'function' && !_origProtoShowSparkEffect) {
-                        _origProtoShowSparkEffect = proto.showSparkEffect;
-                        try {
-                            Object.defineProperty(proto, 'showSparkEffect', {
-                                get: function () {
-                                    var self = this;
-                                    return function _showSparkEffect_hook() {
-                                        if (globalThis._animSkipEnabled && _sparkCallCount < _MAX_SPARK_LOGS) {
-                                            _sparkCallCount++;
-                                            var a2v = arguments.length > 0 ? arguments[0] : 'N/A';
-                                            globalThis._speedLog('[SPARK-CALL#' + _sparkCallCount + '] arg=' + String(a2v).substring(0, 50) + ' type=' + typeof a2v);
-                                            // 前5次调用记录实体 spark 属性
-                                            if (_sparkCallCount <= 5) {
-                                                try {
-                                                    var sparkKeys = ['ready_spark', 'ready_red_spark', 'spark_id', 'r_spark', 'y_spark', 'r_spark_candis', 'cards', 'char_id', 'uid'];
-                                                    var found = [];
-                                                    for (var sk = 0; sk < sparkKeys.length; sk++) {
-                                                        var sv = self[sparkKeys[sk]];
-                                                        if (sv !== undefined) found.push(sparkKeys[sk] + '=' + sv);
-                                                    }
-                                                    globalThis._speedLog('[SPARK-ENT] props: ' + (found.length > 0 ? found.join(', ') : '(none)'));
-                                                } catch (e) { }
-                                            }
-                                        }
-                                        var method = _detectRSpark(self, arguments);
-                                        if (method && globalThis._animSkipEnabled) {
-                                            globalThis._speedLog('[SPARK] >>> R-SPARK GUARD ON via ' + method);
-                                            globalThis._guardOn(15000, 'spark-show');
-                                        }
-                                        return _origProtoShowSparkEffect.apply(self, arguments);
-                                    };
-                                },
-                                configurable: true,
-                                enumerable: true
-                            });
-                        } catch (e) {
-                            proto.showSparkEffect = function () {
-                                var method = _detectRSpark(this, arguments);
-                                if (method && globalThis._animSkipEnabled) {
-                                    globalThis._guardOn(15000, 'spark-fallback');
-                                }
-                                return _origProtoShowSparkEffect.apply(this, arguments);
-                            };
-                        }
-                        hookCount++;
-                        globalThis._speedLog('[PROTO] Hooked showSparkEffect via defineProperty on L' + depth + ':' + constructorName);
-                    }
-
-                    // === v14: Hook checkSparkEffect — R-Spark 候选卡牌检查 ===
-                    var hasCheckSpark = ownKeys.indexOf('checkSparkEffect') >= 0;
-                    if (hasCheckSpark && typeof proto.checkSparkEffect === 'function' && !_origProtoCheckSparkEffect) {
-                        _origProtoCheckSparkEffect = proto.checkSparkEffect;
-                        proto.checkSparkEffect = function () {
-                            var result = _origProtoCheckSparkEffect.apply(this, arguments);
-                            if (result && globalThis._animSkipEnabled) {
-                                _checkSparkFlag = true;
-                                globalThis._speedLog('[SPARK-CHECK] checkSparkEffect returned TRUE — R-Spark candidates exist');
-                            }
-                            return result;
-                        };
-                        hookCount++;
-                        globalThis._speedLog('[PROTO] Hooked checkSparkEffect on prototype L' + depth + ':' + constructorName);
-                    }
-
-                    // === v17: Guard hooks via factory ===
-                    var _guardDefs = [
-                        { name: 'showBuffEffect', logPrefix: 'BUFF-GUARD', counterKey: 'buff', timeoutMs: 800, mode: 'on' },
-                        { name: 'showDebuffEffect', logPrefix: 'BUFF-GUARD', counterKey: 'buff', timeoutMs: 800, mode: 'on' },
-                        { name: 'showCollapseCardEffect', logPrefix: 'COLLAPSE-GUARD', counterKey: 'collapse', timeoutMs: 5000, mode: 'on' },
-                        { name: 'turnOnCollapseAura', logPrefix: 'COLLAPSE-GUARD', counterKey: 'collapse', timeoutMs: 5000, mode: 'on' },
-                        { name: 'turnOffCollapseAura', logPrefix: 'COLLAPSE-GUARD', counterKey: 'collapse', timeoutMs: 1500, mode: 'off' }
-                    ];
-                    for (var gi = 0; gi < _guardDefs.length; gi++) {
-                        if (_hookGuardMethod(proto, _guardDefs[gi].name, ownKeys, _guardDefs[gi], depth, constructorName)) {
-                            hookCount++;
-                        }
-                    }
 
                     proto = Object.getPrototypeOf(proto);
                     depth++;
@@ -583,100 +360,6 @@ function _hookEntityPlayAnimation(enable) {
         }
 
         return hookCount;
-    } else {
-        // Restore prototypes
-        var restored = 0;
-        if (_origProtoPlayAnimation && entities.length > 0) {
-            try {
-                var proto = Object.getPrototypeOf(entities[0]);
-                var depth = 0;
-                while (proto && depth < 10) {
-                    if (Object.getOwnPropertyNames(proto).indexOf('playAnimation') >= 0) {
-                        proto.playAnimation = _origProtoPlayAnimation;
-                        restored++;
-                        break;
-                    }
-                    proto = Object.getPrototypeOf(proto);
-                    depth++;
-                }
-            } catch (e) { }
-            _origProtoPlayAnimation = null;
-        }
-        if (_origProtoSetAnimation && entities.length > 0) {
-            try {
-                var an = entities[0].aninode;
-                if (an) {
-                    var proto = Object.getPrototypeOf(an);
-                    var depth = 0;
-                    while (proto && depth < 10) {
-                        if (Object.getOwnPropertyNames(proto).indexOf('setAnimation') >= 0) {
-                            proto.setAnimation = _origProtoSetAnimation;
-                            restored++;
-                            break;
-                        }
-                        proto = Object.getPrototypeOf(proto);
-                        depth++;
-                    }
-                }
-            } catch (e) { }
-            _origProtoSetAnimation = null;
-        }
-        if (_origProtoGetAnimLen && entities.length > 0) {
-            try {
-                var an = entities[0].aninode;
-                if (an) {
-                    var proto = Object.getPrototypeOf(an);
-                    var depth = 0;
-                    while (proto && depth < 10) {
-                        if (Object.getOwnPropertyNames(proto).indexOf('getAnimationLength') >= 0) {
-                            proto.getAnimationLength = _origProtoGetAnimLen;
-                            restored++;
-                            break;
-                        }
-                        proto = Object.getPrototypeOf(proto);
-                        depth++;
-                    }
-                }
-            } catch (e) { }
-            _origProtoGetAnimLen = null;
-        }
-        // Restore showSparkEffect + checkSparkEffect
-        // v15: showSparkEffect 可能是 accessor property，需要用 Object.defineProperty 恢复
-        if ((_origProtoShowSparkEffect || _origProtoCheckSparkEffect) && entities.length > 0) {
-            try {
-                var proto = Object.getPrototypeOf(entities[0]);
-                var depth = 0;
-                while (proto && depth < 10) {
-                    var pKeys = Object.getOwnPropertyNames(proto);
-                    if (_origProtoShowSparkEffect && pKeys.indexOf('showSparkEffect') >= 0) {
-                        try {
-                            Object.defineProperty(proto, 'showSparkEffect', {
-                                value: _origProtoShowSparkEffect,
-                                writable: true,
-                                configurable: true,
-                                enumerable: true
-                            });
-                        } catch (e2) {
-                            proto.showSparkEffect = _origProtoShowSparkEffect;
-                        }
-                        restored++;
-                    }
-                    if (_origProtoCheckSparkEffect && pKeys.indexOf('checkSparkEffect') >= 0) {
-                        proto.checkSparkEffect = _origProtoCheckSparkEffect;
-                        restored++;
-                    }
-                    proto = Object.getPrototypeOf(proto);
-                    depth++;
-                }
-            } catch (e) { }
-            _origProtoShowSparkEffect = null;
-            _origProtoCheckSparkEffect = null;
-        }
-        globalThis._guardOff('skip-off');
-        _protoHooked = false;
-        _playAnimLogCount = 0;
-        _timerHookLog = 0;
-        return restored;
     }
 }
 
@@ -782,23 +465,17 @@ function _toggleCardSkip() {
     globalThis._animSkipEnabled = !globalThis._animSkipEnabled;
 
     if (globalThis._animSkipEnabled) {
-        globalThis._speedLog('=== ANIMATION SKIP v17: ON (buff/collapse EntityActor guard) ===');
-        _sparkCallCount = 0;
-        _sparkStackLogCount = 0;
+        globalThis._speedLog('=== ANIMATION SKIP v17: ON (select-card guard only) ===');
         _getEntityCallCount = 0;
-        _bemEmitCallCount = 0;
-        _bemDispatchCallCount = 0;
-        _guardCounters.buff = 0;
-        _guardCounters.collapse = 0;
 
         _hookDelayTime();
         _hookFadeAnimations();
         _hookTimeSleep();
 
-        // 动画跳过需要方案4(BattleStage原型链)和黑科技7(Map投毒)提供的 spark 守卫信息
-        // 两个函数都有幂等保护，不会重复安装
+        // 选牌守卫的两条触发点：06 的选牌弹窗 hook + 本文件的 selectCardRSpark 栈检测
         try { _installComprehensiveSparkGuard(); } catch (e) { }
         try { _installSparkGuard(); } catch (e) { }
+        try { _installGuardHooks(); } catch (e) { }
 
 
         // Hook 战斗实体的 playAnimation + getAnimationLength (v11)
@@ -819,12 +496,7 @@ function _toggleCardSkip() {
             ' delaySkip=' + _skipStats.delaySkipped +
             ' tsHook=' + _tsHookCount +
             ' tsSkip=' + _tsSkipCount +
-            ' entityCalls=' + _getEntityCallCount +
-            ' sparkCalls=' + _sparkCallCount +
-            ' buffGuard=' + _guardCounters.buff +
-            ' collapseGuard=' + _guardCounters.collapse +
-            ' bemEmit=' + _bemEmitCallCount +
-            ' bemDispatch=' + _bemDispatchCallCount);
+            ' entityCalls=' + _getEntityCallCount);
 
         // 停止定时器
         if (_entityTimer) {
@@ -832,11 +504,9 @@ function _toggleCardSkip() {
             _entityTimer = null;
         }
 
-        // 恢复所有 playAnimation + getAnimLen hooks (v11)
-        var restored = _hookEntityPlayAnimation(false);
-        globalThis._speedLog('[SKIP] Restored ' + restored + ' playAnimation+getAnimLen hooks');
-
-
+        // 不再卸载原型 hook：守卫（灵光一闪 / cut-in / 必杀）依赖它们常驻，
+        // 而"是否跳过"完全由 wrapper 里的 _animSkipEnabled 判断控制 ——
+        // 关掉开关后这些 wrapper 只是原样透传，没有任何副作用。
         globalThis._guardOff('toggle-off');
     }
 
@@ -850,8 +520,10 @@ function _toggleCardSkip() {
         _hookDelayTime: _hookDelayTime,
         _hookFadeAnimations: _hookFadeAnimations,
         _hookTimeSleep: _hookTimeSleep,
+        installGuardHooks: _installGuardHooks,
     };
     __app.registerService('AnimSkipService', AnimSkipService);
+    globalThis._installGuardHooks = _installGuardHooks;
     globalThis._toggleCardSkip = _toggleCardSkip;
     globalThis._hookDelayTime = _hookDelayTime;
     globalThis._hookFadeAnimations = _hookFadeAnimations;

@@ -31,6 +31,7 @@ CZN Speed 是一个 LSPosed 模块，为单机游戏 **Chaos Zero Nightmare** �
 
 - **变速**：默认 6 档（0、0.5、1、3、5、10），档位数量与数值可自定义（2~8 档，上限 999），0x 表示暂停。
 - **动画跳过**：跳过战斗中的出牌、攻击与演出动画。
+- **自动战斗解锁**：解除部分模式「无法使用自动战斗」的限制，更多面板可开关，**需在进入战斗前设置**。
 - **动画守卫**：灵光一闪、Cut-in、必杀技等需要完整演出的流程临时回到 1x，结束后自动恢复。
 - **悬浮控制**：收起球 / 展开胶囊 / 更多面板 / 档位编辑弹窗四态；仅收起态可拖动，档位用内置数字键盘编辑。
 - **隐藏悬浮窗**：可完全隐藏；入口为更多面板或长按收起球，恢复靠左下角隐形热区（连点三次或长按）。隐藏不写配置、不改倍速。
@@ -78,45 +79,18 @@ JS bundle 由 CMake 在编译前自动生成，无需手动干预；如需单独
 cd app/src/main/cpp && python extract_js.py && python gen_headers.py
 ```
 
-## 项目结构
+## 排查
 
-```
-app/src/main/
-├── assets/xposed_init            # 模块入口类声明
-├── java/com/czn/mod/Main.java    # IXposedHookLoadPackage 入口与 JNI 声明
-├── res/values/arrays.xml         # 推荐作用域（xposed_scope）
-├── AndroidManifest.xml           # 模块元信息
-└── cpp/
-    ├── czn_core.cpp              # native 注入引擎与 JNI 入口
-    ├── CMakeLists.txt            # 编译配置与 JS 头生成
-    ├── extract_js.py             # JS bundle 装配
-    ├── gen_headers.py            # JS → C 头文件
-    ├── 06_spark_guard.js         # 动画守卫（外部分节）
-    └── 07_anim_skip.js           # 动画跳过（外部分节）
-```
+装好后没有任何反应，按顺序确认：
 
-悬浮层界面、配置读写与调度器守卫等分节内嵌在 `extract_js.py` 中，编译前按固定顺序拼装为单个 bundle 注入游戏。
+1. LSPosed 里模块已启用，作用域勾选了目标游戏；
+2. 强制停止游戏进程后重新启动——模块在进程启动时装载，热重启无效；
+3. 悬浮球是否出现。没有出现说明注入未成功。
 
-## 工作原理
+仍然不行时抓日志反馈，文件在 `/storage/emulated/0/Android/data/<包名>/files/`：
 
-1. LSPosed 调用 `Main.handleLoadPackage`，按包名与主进程过滤。
-2. 通过 JNI 进入 `nativeStart`，在独立线程执行注入，不阻塞游戏启动。
-3. 等 `libssr.so` 映射、V8 平台线程就绪，解析 ELF 动态符号表定位 14 个 V8 API；任一缺失即惰性退出。
-4. 改写 `AAsset_read` 与 `AAssetManager_open` 的 GOT 槽作为触发点——资源读取恰好发生在 JS 线程上，且只在当前线程持有 V8 context 时注入。
-5. 在自建的 `HandleScope` 内执行 JS bundle。脚本不把回调托管给引擎的长生命周期对象（调度器、定时器、全局监听），因此切场景或重建 V8 上下文不会留下悬空回调。
-6. 之后 GOT 槽保持挂载但完全透传，只做健康检查：层与驱动都在则不动，层丢失则重注入，驱动丢失则重新挂载。检查只在资源读取时发生，不参与逐帧逻辑。
+- `.czn_log` —— 运行时日志，保留最近 120 行（启动、挂载、异常），反馈问题时带上这个；
+- `.czn_status` —— 单行注入状态：`armed` / `stage1 ok` / `driver re-armed` / `FAIL: <原因>`；
+- `.czn_dump` —— 仅在脚本抛异常时生成，含错误堆栈。
 
-## 诊断
-
-文件均在 `/storage/emulated/0/Android/data/<包名>/files/`：
-
-- `.czn_status` —— native 单行注入状态：`armed` / `stage1 ok` / `driver re-armed` / `FAIL: <原因>`。
-- `.czn_log` —— JS 层追加日志，保留最近 120 行（启动、挂载、驱动重挂、异常），体积有界。
-- `.czn_dump` —— 仅在 bundle 抛异常时生成，含错误堆栈与环形日志。
-
-实时日志：`adb logcat -s CZN`。排查闪退可在同目录写 `czn_flags`（十六进制位掩码，缺省全开）逐项关闭功能定位，详见代码注释；不需要时删除即可。
-
-## 已知限制
-
-- V8 符号依赖引擎版本：游戏更新后符号缺失会惰性退出（不影响游戏运行），需同步更新符号表。
-- 仅提供 arm64-v8a 构建。
+实时日志：`adb logcat -s CZN`。闪退时可在同目录新建 `czn_flags`（十六进制位掩码，缺省全开）逐项关闭功能定位，位含义见代码注释，不需要时删除即可。

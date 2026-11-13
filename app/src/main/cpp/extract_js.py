@@ -84,6 +84,7 @@ SEC04 = r"""// --- [MODULE START] 04_config ---
     // the value is absent.
     if (globalThis._curSpeed === undefined) globalThis._curSpeed = 1;          // applied speed (float, single source of truth)
     if (globalThis._skipOnBoot === undefined) globalThis._skipOnBoot = false;
+    if (globalThis._abOn === undefined) globalThis._abOn = true;               // 自动战斗解锁开关
     if (globalThis._btnPosX === undefined) globalThis._btnPosX = 60;
     if (globalThis._btnPosY === undefined) globalThis._btnPosY = 100;
     if (globalThis._speedsList === undefined) globalThis._speedsList = [0, 0.5, 1, 3, 5, 10];   // editable speed levels
@@ -97,6 +98,7 @@ SEC04 = r"""// --- [MODULE START] 04_config ---
     // report on a user device without a rebuild.
     //   0x100 overlay UI   0x200 tick driver   0x400 timeScale guard
     //   0x800 prototype hooks (spark guard)    0x1000 touch listener
+    //   0x2000 auto-battle unlock (yuna table hook)
     globalThis._flags = 0xFFFFFFFF;
     try {
         var _ff = FU();
@@ -123,6 +125,7 @@ SEC04 = r"""// --- [MODULE START] 04_config ---
                 var v = line.substring(eq + 1).trim();
                 if (k === 'speed') { var s = parseFloat(v); if (!isNaN(s) && s >= 0 && isFinite(s)) globalThis._curSpeed = Math.round(s * 100) / 100; }
                 else if (k === 'skip') { globalThis._skipOnBoot = (v === '1'); }
+                else if (k === 'ab') { globalThis._abOn = (v !== '0'); }
                 else if (k === 'btn_x') { var x = parseInt(v, 10); if (!isNaN(x)) globalThis._btnPosX = x; }
                 else if (k === 'btn_y') { var y = parseInt(v, 10); if (!isNaN(y)) globalThis._btnPosY = y; }
                 else if (k === 'speeds') { var L = globalThis._parseLevels(v); if (L && L.length >= 2) globalThis._speedsList = L; }
@@ -135,6 +138,7 @@ SEC04 = r"""// --- [MODULE START] 04_config ---
             var txt = ['# czn mod',
                        'speed=' + globalThis._curSpeed,
                        'skip=' + (globalThis._animSkipEnabled ? '1' : '0'),
+                       'ab=' + (globalThis._abOn === false ? '0' : '1'),
                        'btn_x=' + Math.round(globalThis._btnPosX || 60),
                        'btn_y=' + Math.round(globalThis._btnPosY || 100),
                        'speeds=' + (globalThis._speedsList || []).join(','), ''].join('\n');
@@ -218,7 +222,11 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
 // fixed it because that path rewrites all slots plus the env.
 (function () {
     var ST = { until: 0, since: 0, reason: '', cb: null };
-    var HARD_MAX = 60000;      // no guard outlives this, whatever its reason
+    // A guard is a window where the engine must run at 1x, so a stuck guard
+    // is no longer harmless: it pins the game to real time. 20s wall clock
+    // covers the longest scripted performance (fatal attack + cut-in) and
+    // still cannot leave a player slow for a whole fight.
+    var HARD_MAX = 20000;      // no guard outlives this, whatever its reason
     var LEGACY_GRACE = 10000;  // flag raised by an unmigrated path, no deadline
     var RECO_MS = 300;         // min gap between reconciliations
     var TS_LOG_MAX = 24;       // external timeScale writes worth recording
@@ -243,6 +251,19 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
     }
 
     globalThis._guardState = ST;
+
+    // What the engine should be running at right now. While a guard is up the
+    // answer is 1 for anything faster than 1: that is the whole point of the
+    // guard ("let this performance play out at real speed"), and it must not
+    // depend on the game lowering timeScale by itself -- most of them never
+    // do, they just wait for the animation. A guard never speeds the game up:
+    // a user sitting at 0.5x or 0x (paused) keeps their own value.
+    function _target() {
+        var v = globalThis._curSpeed;
+        if (typeof v !== 'number' || !isFinite(v) || v < 0) v = 1;
+        if (globalThis._sparkGuardActive && v > 1) return 1;
+        return v;
+    }
 
     // every channel the game can drop to 1x: the director's scheduler slots
     // (the battle scheduler is often not slot 0) plus the engine env
@@ -329,11 +350,10 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
         }
     }
 
-    // unconditional: _curSpeed is the user's intent and is never rewritten
-    // while a guard is up, so putting it back is always the right move
+    // unconditional: the guard decides the target, and _curSpeed is the
+    // user's intent which is never rewritten while a guard is up
     globalThis._restoreSpeed = function () {
-        var v = globalThis._curSpeed;
-        if (typeof v !== 'number' || !isFinite(v) || v < 0) v = 1;
+        var v = _target();
         globalThis._setEngineSpeed(v);
         globalThis._slog('[GUARD] restore ' + v + 'x');
     };
@@ -364,11 +384,20 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
     // ms <= 0 means "held until its END event", capped by HARD_MAX
     globalThis._guardOn = function (ms, reason, cb) {
         var now = Date.now();
+        var was = globalThis._sparkGuardActive;
         ST.until = (typeof ms === 'number' && ms > 0) ? now + _toWall(ms) : -1;
         if (!ST.since) ST.since = now;
         ST.reason = reason || ST.reason || '?';
         if (typeof cb === 'function') ST.cb = cb;
         globalThis._sparkGuardActive = true;
+        // Pin the engine to 1x immediately instead of waiting for the next
+        // tick: at 5x a 0.5s tick is already a quarter of the whole
+        // performance, which is exactly what used to make the guard look
+        // like it did nothing. Repeat ONs (a burst of sparks, one per card)
+        // only write once -- the engine is already at 1.
+        if (!was && globalThis._curSpeed > 1) {
+            try { globalThis._setEngineSpeed(1); } catch (e) { }
+        }
         globalThis._slog('[GUARD] >>> on ' + ST.reason +
                          (ST.until > 0 ? ' (' + (ST.until - now) + 'ms)' : ' (until end)'));
     };
@@ -400,12 +429,15 @@ SEC05 = r"""// --- [MODULE START] 05_guard ---
                 if (now - ST.since > (ST.until < 0 ? HARD_MAX : LEGACY_GRACE))
                     _release((ST.until < 0 ? 'hard-max ' : 'legacy ') + ST.reason);
             }
-            return;
+        } else {
+            ST.since = 0;
         }
-        ST.since = 0;
-        // reconcile: nothing may leave the engine running off-speed
+        // reconcile: nothing may leave the engine off its target. While a
+        // guard is up the target is 1, so this keeps re-pinning it even when
+        // the game re-applies its own timeScale in the middle of a
+        // performance (skill cast, cut-in teardown, scene swap).
         if (now - _lastReco < RECO_MS) return;
-        var want = globalThis._curSpeed;
+        var want = _target();
         if (typeof want !== 'number' || !isFinite(want)) return;
         var bad = null;
         for (var i = 0; i < list.length && !bad; i++) {
@@ -450,7 +482,7 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
     var BTN_W = 60, BTN_H = CAP_H;// ball size / touch hot-zone (H matches capsule)
     var DOTS_X = 124, ARR_L_X = 19, NUM_X = 56, ARR_R_X = 93; // capsule inner x
     var BALL_A = 70;               // collapsed ball alpha (node opacity stays 255)
-    var PAN_W = 304, PAN_H = 288;  // more panel size
+    var PAN_W = 304, PAN_H = 332;  // more panel size
     var ED_W = 320, ED_H = 432;    // edit dialog size
     var GAP = 14;                  // panel gap under the capsule
     var HOT_W = 100, HOT_H = 100, HOT_M = 8; // ghost hot-zone (bottom-left corner)
@@ -545,6 +577,15 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
         try { parent.addChild(t, (z || 0) + 1); } catch (e) { }
         try { t.setPosition(cx, cy); } catch (e) { }
         if (typeof alpha === 'number') { try { t.setOpacity(alpha); } catch (e) { } }
+        return t;
+    }
+    // Left-anchored label: _label positions text by its CENTER, so two labels of
+    // different length that share the same cx do NOT share a left margin (that is
+    // what made '自动战斗解锁' stick out past '跳过动画'). Anchor (0,0.5) puts the
+    // text's left edge exactly at x, independent of glyph width.
+    function _labelL(parent, text, size, x, cy, z, col) {
+        var t = _label(parent, text, size, x, cy, z, col);
+        try { if (t && t.setAnchorPoint) t.setAnchorPoint(0, 0.5); } catch (e) { }
         return t;
     }
     function _dots(parent, cx, cy, col) {
@@ -802,7 +843,7 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
         refs.panelBig = _label(node, _isPaused(a) ? '0' : _fmt(a), 26, PAN_W - pad - 44, PAN_H - pad - 22, 1);
         _label(node, '倍', 14, PAN_W - pad - 12, PAN_H - pad - 22, 1, _color(200, 200, 208, 255));
         var L = _levels(), n = L.length;
-        var segW = (PAN_W - pad * 2 - 3 * (n - 1)) / n, segH = 40, segY = 184;
+        var segW = (PAN_W - pad * 2 - 3 * (n - 1)) / n, segH = 40, segY = 236;
         for (var i = 0; i < n; i++) {
             var sx = pad + i * (segW + 3);
             var act = (i === speedIdx);
@@ -810,10 +851,16 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
             _label(node, _fmt(L[i]), 15, sx + segW / 2, segY + segH / 2, 3);
         }
         var ty = 132;
-        _label(node, '跳过动画', 15, pad + 30, ty + 22, 1, _color(200, 200, 208, 255));
+        _labelL(node, '跳过动画', 15, pad, ty + 22, 1, _color(200, 200, 208, 255));
         var swX = PAN_W - pad - 52, swW = 40, swH = 24, swY = ty + 10;
         _layer(node, globalThis._animSkipEnabled ? _color(83, 74, 183, 255) : _color(58, 58, 66, 255), swW, swH, swX, swY, 2);
         _layer(node, _color(255, 255, 255, 255), 16, 16, swX + (globalThis._animSkipEnabled ? 20 : 4), swY + 4, 3);
+        // 自动战斗解锁：运行期改写 ingame_content_config 的行数据，不改资源文件
+        var ay = 184, abOn = (globalThis._abOn !== false);
+        _labelL(node, '自动战斗解锁', 15, pad, ay + 22, 1, _color(200, 200, 208, 255));
+        var awX = PAN_W - pad - 52, awW = 40, awH = 24, awY = ay + 10;
+        _layer(node, abOn ? _color(83, 74, 183, 255) : _color(58, 58, 66, 255), awW, awH, awX, awY, 2);
+        _layer(node, _color(255, 255, 255, 255), 16, 16, awX + (abOn ? 20 : 4), awY + 4, 3);
         var ey = 80;
         _layer(node, _color(42, 42, 51, 255), PAN_W - pad * 2, 44, pad, ey, 2);
         _label(node, '编辑档位', 16, PAN_W / 2, ey + 22, 3);
@@ -825,6 +872,7 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
         _regCap();
         for (var j = 0; j < n; j++) _reg('seg' + j, panX + pad + j * (segW + 3), panY + segY, segW, segH);
         _reg('skip', panX + swX, panY + swY, swW, swH);
+        _reg('ab', panX + awX, panY + awY, awW, awH);
         _reg('edit', panX + pad, panY + ey, PAN_W - pad * 2, 44);
         _reg('hide', panX + pad, panY + hy, PAN_W - pad * 2, 56);
         mode = 'more';
@@ -972,6 +1020,7 @@ SEC09 = r"""// --- [MODULE START] 09_speed_ui ---
             if (id === 'l') { _step(-1); _buildPanel(); return; }
             if (id === 'r') { _step(1); _buildPanel(); return; }
             if (id === 'skip') { try { if (typeof globalThis._toggleCardSkip === 'function') globalThis._toggleCardSkip(); } catch (e) { } _buildPanel(); return; }
+            if (id === 'ab') { try { if (typeof globalThis._toggleAutoBattle === 'function') globalThis._toggleAutoBattle(); } catch (e) { } _buildPanel(); return; }
             if (id === 'edit') { editBuf = _levels().join(','); _buildEdit(); return; }
             if (id === 'hide') { _enterHidden(); return; }
             if (id && id.indexOf('seg') === 0) { var si = parseInt(id.substring(3), 10); var Lv = _levels(); if (!isNaN(si) && Lv[si] !== undefined) { speedIdx = si; _apply(Lv[si]); } _buildPanel(); return; }
@@ -1112,6 +1161,9 @@ BOOT = r"""
                 try { if (globalThis._curSpeed !== 1 && !globalThis._sparkGuardActive && typeof globalThis._applySpeed === 'function') globalThis._applySpeed(globalThis._curSpeed); } catch (e) { }
                 try { if (globalThis._skipOnBoot && !globalThis._animSkipEnabled && typeof globalThis._toggleCardSkip === 'function') globalThis._toggleCardSkip(); } catch (e) { }
             }
+            // auto-battle unlock: waits for the native yuna bridge (appears a few
+            // seconds in) and installs its table hooks once; idempotent, cheap
+            try { if (typeof globalThis._tryInstallAutoBattle === 'function') globalThis._tryInstallAutoBattle(); } catch (e) { }
             var scene = null;
             try { scene = cc.Director.getInstance().getRunningScene(); } catch (e) { }
             if (!scene) {
@@ -1132,6 +1184,10 @@ BOOT = r"""
                     // speed no longer re-applied here: _guardTick reconciles it
                     // only when the engine actually drifted (no cfg.dat churn)
                     try { if (globalThis._animSkipEnabled && globalThis.AnimSkipService && typeof globalThis.AnimSkipService.refreshHooks === 'function') globalThis.AnimSkipService.refreshHooks(); } catch (e) { }
+                    // the guard is independent of the skip toggle, so its hooks
+                    // are installed here rather than from _toggleCardSkip: the
+                    // entity list is empty outside a fight, hence the retry
+                    try { if (typeof globalThis._installGuardHooks === 'function') globalThis._installGuardHooks(); } catch (e) { }
                 }
             }
             // keep the ball reading in sync with the engine's actual timeScale
@@ -1233,7 +1289,7 @@ BOOT = r"""
 """
 
 order = ["00_timers.js", "03_framework.js", "04_logger_config.js", "05_guard.js",
-         "06_spark_guard.js", "07_anim_skip.js", "09_speed_ui.js"]
+         "06_spark_guard.js", "07_anim_skip.js", "08_auto_battle.js", "09_speed_ui.js"]
 # Context marker -- the native side probes this global to decide whether this
 # V8 context already carries the layer. It must be the FIRST statement so it is
 # in place even if a later section throws. Do not compare V8 context pointers
@@ -1249,7 +1305,7 @@ parts = ["// CZN runtime module JS",
          MARKER]
 for name in order:
     parts.append("// ======== " + name + " ========")
-    if name in ("06_spark_guard.js", "07_anim_skip.js"):
+    if name in ("06_spark_guard.js", "07_anim_skip.js", "08_auto_battle.js"):
         parts.append(io.open(os.path.join(here, name), encoding="utf-8").read())
     else:
         parts.append(sec[name])
@@ -1309,7 +1365,8 @@ for need in ["_cznAttachUI", "__cznBootTick", "__cznArmDriver", "registerService
              "function _onTouchBegan(p)", "function _onTouchEnded(p)",
              "_cznRefreshUI", "_buildCapsule", "_buildPanel", "_buildEdit",
              "_parseLevels", "_paintBall", "_crumb",
-             "_enterHidden", "_exitHidden", "_buildGhost", "_tickHolds"]:
+             "_enterHidden", "_exitHidden", "_buildGhost", "_tickHolds",
+             "_tryInstallAutoBattle", "_toggleAutoBattle", "patchRow", "_abOn"]:
     assert need in out, "missing: " + need
 assert "__app.on" not in out and "registerPage" not in out, "dead framework members remain"
 assert "czn_speed v" not in out and "czn-speed v" not in out, "version string leaked"
